@@ -37,8 +37,11 @@ resets to the enemy pad. Progress is tracked in the MISSION panel; no extra keys
 ### The safehouse
 
 A dug-in hangar on the blind side of the mountain, roughly 860 m west of the
-enemy pad. It stays dark until the pod is aboard, then lights a green column so
-you can find it — a hidden base that only signals when you need it.
+enemy pad. An on-screen waypoint marks it from anywhere on the map: a reticle
+with a distance readout when it is in view, a chevron pinned to the screen edge
+pointing the way when it is not. It reads SAFEHOUSE while you are outbound and
+switches to DELIVER HERE once the pod is aboard, when the hangar also lights a
+green column of its own.
 
 Its mouth faces **west, away from hostile airspace**, so you overshoot and turn
 back into it rather than diving straight in, and anything chasing you from the

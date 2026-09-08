@@ -34,12 +34,57 @@ export default function App() {
   const [detected, setDetected] = useState([])
   const [modelInfo, setModelInfo] = useState('')
   const listRef = useRef(null)
+  // The waypoint is written straight to the DOM rather than through state: it
+  // updates every frame, and re-rendering the whole HUD 60x a second to move
+  // one marker would be wasteful.
+  const wpRef = useRef(null)
+  const wpArrowRef = useRef(null)
+  const wpNameRef = useRef(null)
+  const wpDistRef = useRef(null)
 
   useEffect(() => {
     const sim = createSim(canvasRef.current, {
       onTelemetry: setTelem,
       onDetect: (p) => setDetected((prev) => [p, ...prev]),
       onReady: setModelInfo,
+      onWaypoint: (w) => {
+        const el = wpRef.current
+        if (!el) return
+        // hide once delivered, and when you are close enough to just look at it
+        if (w.done || w.dist < 30) { el.style.display = 'none'; return }
+        el.style.display = ''
+
+        let { x, y } = w
+        if (w.behind) {
+          // behind the camera the projected position is meaningless; only the
+          // direction is, so push it well outside the viewport and let the
+          // clamp below pin it to the correct edge
+          const len = Math.hypot(x, y) || 1
+          x = (x / len) * 2
+          y = (y / len) * 2
+        }
+        const off = w.behind || Math.abs(x) > 1 || Math.abs(y) > 1
+        if (off) {
+          // scale the direction out to whichever screen edge it meets first
+          const k = Math.min(1 / Math.max(Math.abs(x), 1e-6), 1 / Math.max(Math.abs(y), 1e-6))
+          x *= k
+          y *= k
+        }
+        const M = 7   // percent inset, so the marker never straddles the edge
+        el.style.left = `${50 + x * (50 - M)}%`
+        el.style.top = `${50 - y * (50 - M)}%`
+        el.classList.toggle('offscreen', off)
+        el.classList.toggle('active', w.active)
+        // the chevron points up by default; screen direction is (x, -y)
+        if (wpArrowRef.current) {
+          wpArrowRef.current.style.transform =
+            `rotate(${(Math.atan2(x, y) * 180) / Math.PI}deg)`
+        }
+        if (wpNameRef.current) {
+          wpNameRef.current.textContent = w.active ? 'DELIVER HERE' : 'SAFEHOUSE'
+        }
+        if (wpDistRef.current) wpDistRef.current.textContent = `${w.dist.toFixed(0)} m`
+      },
     })
     return () => sim.dispose()
   }, [])
@@ -236,6 +281,23 @@ export default function App() {
           </g>
         </svg>
       )}
+
+      <div className="hud waypoint" ref={wpRef} style={{ display: 'none' }}>
+        <svg className="wp-mark wp-chevron" viewBox="0 0 32 32" ref={wpArrowRef}>
+          <polygon points="16,3 26,26 16,20 6,26" />
+        </svg>
+        <svg className="wp-mark wp-reticle" viewBox="0 0 32 32">
+          <circle cx="16" cy="16" r="8.5" />
+          <line x1="16" y1="1" x2="16" y2="6" />
+          <line x1="16" y1="26" x2="16" y2="31" />
+          <line x1="1" y1="16" x2="6" y2="16" />
+          <line x1="26" y1="16" x2="31" y2="16" />
+        </svg>
+        <div className="wp-label">
+          <span ref={wpNameRef}>SAFEHOUSE</span>
+          <b ref={wpDistRef}>—</b>
+        </div>
+      </div>
 
       <div className="hud credit">
         {modelInfo && <>model: {modelInfo} · </>}three.js + react

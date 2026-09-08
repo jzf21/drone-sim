@@ -114,7 +114,7 @@ const FAULT_NOTES = {
   splice: ['Hotspot detected', 'Corrosion at sleeve', 'Bird-caging strands'],
 }
 
-export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
+export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }) {
   // Two streams, following the same convention as the cloud deck's `crand`:
   // `drand` drives world decoration (mountain ring, structures, vegetation) and
   // `rand` drives inspection content (which parts exist, which are faulted).
@@ -1132,6 +1132,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
   const TMP_PREV = new THREE.Vector3()
   const TMP_SEP = new THREE.Vector3()
   const TMP_N = new THREE.Vector3()
+  const TMP_MARK = new THREE.Vector3()
   const clock = new THREE.Clock()
   let telemAcc = 0
   let frames = 0
@@ -1759,6 +1760,27 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     sky.position.copy(camera.position)
 
     renderer.render(scene, camera)
+
+    // Safehouse waypoint. Projected after the render, so the camera matrices
+    // are already current for this frame, and reported every frame rather than
+    // on the 8 Hz telemetry tick — a screen-space marker moves ~18% of the
+    // viewport per tick at full yaw rate, which reads as a stutter.
+    if (onWaypoint) {
+      TMP_MARK.set(SAFEHOUSE.x, HOME_Y + 14, SAFEHOUSE.z)
+      TMP_MARK.applyMatrix4(camera.matrixWorldInverse)
+      const behind = TMP_MARK.z > 0
+      TMP_MARK.applyMatrix4(camera.projectionMatrix)
+      onWaypoint({
+        // normalised device coords; behind the camera the projection flips, so
+        // the sign is corrected and the caller treats it as direction only
+        x: behind ? -TMP_MARK.x : TMP_MARK.x,
+        y: behind ? -TMP_MARK.y : TMP_MARK.y,
+        behind,
+        dist: Math.hypot(p.x - SAFEHOUSE.x, p.z - SAFEHOUSE.z),
+        active: laden,
+        done: mission === 'COMPLETE',
+      })
+    }
   }
   animate()
 
