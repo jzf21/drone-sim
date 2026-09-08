@@ -31,9 +31,25 @@ red = needs service (blinks in the scene, reason shown in the inspection log).
 A cargo pod sits on the enemy landing pad at the centre of the hostile zone,
 marked by a cyan light column visible from outside the perimeter. Fly in, hover
 within 7 m of the pad and under 9 m above it, and hold for ~1.6 s to winch it
-aboard — then outrun the rival drones until they break contact. Get shot down
-carrying it and the pod resets to the pad. Progress is tracked in the MISSION
-panel; no extra keys.
+aboard. Then run it home to the safehouse. Get shot down carrying it and the pod
+resets to the enemy pad. Progress is tracked in the MISSION panel; no extra keys.
+
+### The safehouse
+
+A dug-in hangar on the blind side of the mountain, roughly 860 m west of the
+enemy pad. It stays dark until the pod is aboard, then lights a green column so
+you can find it — a hidden base that only signals when you need it.
+
+Its mouth faces **west, away from hostile airspace**, so you overshoot and turn
+back into it rather than diving straight in, and anything chasing you from the
+east is looking at a solid back wall. Fly in through the mouth and hold over the
+lit pad for ~1.6 s to unload.
+
+The delivery is not gated on shaking pursuit — you can land the pod hot, with
+rivals still on you. Breaking contact is a survival problem, not a win
+condition. The hangar is also simply the best hard cover on the map, and it is
+there from the start: three walls and a roof mean that once you are inside,
+every sightline but the mouth is blocked. You can duck into it any time.
 
 ## World
 
@@ -48,6 +64,8 @@ panel; no extra keys.
   drone so everything casts shadows.
 - Nav lights and a tail strobe on the airframe, corona glow and arc sparks on
   faulted hardware, tracer rounds, impact sparks and damage smoke.
+- A friendly safehouse hangar tucked behind the mountain, with an apron,
+  approach lights, a windsock and a roof antenna.
 - Buildings everywhere: a fortified enemy compound (hangars, fuel tanks,
   container stacks, a blast-wall ring around the pad, a radar mast) plus
   warehouses, barns, silos and water towers scattered across the map, and
@@ -93,9 +111,8 @@ What does not help:
 - **Hiding from one drone.** A spotter radios your position to the others; they
   will come and look, though only a drone's own eyes let it open fire.
 - **Grabbing the pod quietly.** The winch and the pod itself are loud —
-  detection rates rise sharply while securing and carrying, so the extraction is
-  where cover earns its keep. Getting clear now means genuinely losing them, not
-  just crossing back over the perimeter line.
+  detection rates rise sharply while securing and carrying, so the long run home
+  to the safehouse is where cover earns its keep.
 
 ## Credits
 

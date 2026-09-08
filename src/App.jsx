@@ -68,12 +68,16 @@ export default function App() {
         <div className="panel mission">
           <h2>MISSION · CARGO RECOVERY</h2>
           {telem.mission === 'COMPLETE' ? (
-            <div className="mission-line done">✔ Payload extracted — mission complete</div>
-          ) : telem.mission === 'CARRYING' ? (
+            <div className="mission-line done">✔ Payload delivered — mission complete</div>
+          ) : telem.mission === 'CARRYING' || telem.mission === 'DELIVERING' ? (
             <>
-              <div className="mission-line hot">◆ PAYLOAD ABOARD — outrun them and break contact</div>
+              <div className="mission-line hot">◆ PAYLOAD ABOARD — run it to the safehouse</div>
               <div className="telem-row small">
-                <span>TO SAFETY</span><b>{telem.missionDist.toFixed(0)} m</b>
+                <span>TO SAFEHOUSE</span><b>{telem.missionDist.toFixed(0)} m</b>
+              </div>
+              <div className="hint">
+                Follow the green light column, west past the mountain. Fly in through
+                the hangar mouth — it faces away from you — and hold over the pad.
               </div>
             </>
           ) : telem.mission === 'LOST' ? (
@@ -94,6 +98,16 @@ export default function App() {
               </div>
               <div className="telem-row small">
                 <span>SECURING</span><b>{Math.round(telem.secure * 100)}%</b>
+              </div>
+            </>
+          )}
+          {telem.mission === 'DELIVERING' && (
+            <>
+              <div className="progress">
+                <div className="bar delivering" style={{ width: `${telem.deliver * 100}%` }} />
+              </div>
+              <div className="telem-row small">
+                <span>UNLOADING</span><b>{Math.round(telem.deliver * 100)}%</b>
               </div>
             </>
           )}
@@ -160,7 +174,7 @@ export default function App() {
           <div className="down-title">DRONE DOWN</div>
           <div className="down-sub">
             {telem.mission === 'LOST'
-              ? <>airframe destroyed, payload dropped — press <b>R</b> to redeploy</>
+              ? <>airframe destroyed, payload lost — press <b>R</b> to redeploy</>
               : <>airframe destroyed — press <b>R</b> to redeploy</>}
           </div>
         </div>
@@ -168,7 +182,7 @@ export default function App() {
       {telem && telem.mission === 'COMPLETE' && (
         <div className="hud complete-overlay">
           <div className="complete-title">MISSION COMPLETE</div>
-          <div className="complete-sub">cargo pod recovered — clear of hostile airspace</div>
+          <div className="complete-sub">cargo pod delivered to the safehouse</div>
         </div>
       )}
       {telem && telem.threat === 'ENGAGED' && !telem.down && (

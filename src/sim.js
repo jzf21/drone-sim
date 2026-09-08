@@ -15,10 +15,17 @@ const POND = { x: 260, z: 230, r: 55 }
 const MTN = { x: -140, z: 330, h: 150, sigma: 60 }
 const POOL = { x: -140, z: 205, r: 14 }
 const ZONE = { x: 520, z: 330, r: 200 }   // hostile airspace
-const ZONE_SAFE = ZONE.r + 60   // rivals give up the chase outside this radius
 const PICKUP_R = 7        // horizontal hover radius over the pad (m)
 const PICKUP_CEIL = 9     // max height above the pad to get a grapple (m)
 const SECURE_TIME = 1.6   // hover-and-hold to winch the payload aboard (s)
+
+// -- safehouse: where the recovered pod is delivered -------------------------
+// Dug in on the blind side of the mountain — the massif blocks the sightline
+// from hostile airspace even from 140 m up.
+const SAFEHOUSE = { x: -340, z: 330 }
+const DROP_R = 5          // horizontal radius over the safehouse pad (m)
+const DROP_CEIL = 7.5     // must be under the hangar roof to unload (m)
+const DELIVER_TIME = 1.6  // hover-and-hold to winch the pod down (s)
 
 // -- rival sensor model -----------------------------------------------------
 const SENSE_RANGE = 155   // how far their optics reach (m)
@@ -108,7 +115,15 @@ const FAULT_NOTES = {
 }
 
 export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
-  const rand = mulberry32(1337)
+  // Two streams, following the same convention as the cloud deck's `crand`:
+  // `drand` drives world decoration (mountain ring, structures, vegetation) and
+  // `rand` drives inspection content (which parts exist, which are faulted).
+  // Keeping them apart means adding or moving scenery can no longer re-roll the
+  // fault layout — the rejection loops in scatterVegetation consume a different
+  // number of draws whenever an exclusion zone changes, which used to shift
+  // everything downstream of them.
+  const drand = mulberry32(1337)
+  const rand = mulberry32(4242)
 
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true })
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
@@ -435,13 +450,13 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
   {
     const mat = new THREE.MeshStandardMaterial({ color: 0x62798b, roughness: 1, flatShading: true })
     for (let i = 0; i < 26; i++) {
-      const a = (i / 26) * Math.PI * 2 + rand() * 0.2
-      const dist = 1000 + rand() * 500
-      const h = 110 + rand() * 150
-      const r = 130 + rand() * 150
-      const m = new THREE.Mesh(new THREE.ConeGeometry(r, h, 5 + Math.floor(rand() * 3)), mat)
+      const a = (i / 26) * Math.PI * 2 + drand() * 0.2
+      const dist = 1000 + drand() * 500
+      const h = 110 + drand() * 150
+      const r = 130 + drand() * 150
+      const m = new THREE.Mesh(new THREE.ConeGeometry(r, h, 5 + Math.floor(drand() * 3)), mat)
       m.position.set(Math.cos(a) * dist, h / 2 - 25, Math.sin(a) * dist)
-      m.rotation.y = rand() * Math.PI
+      m.rotation.y = drand() * Math.PI
       scene.add(m)
     }
   }
@@ -449,9 +464,9 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
   // Structures go down before vegetation so trees never sprout inside a hangar.
   // This shifts the RNG sequence, so the tree layout differs from before — still
   // fully deterministic, just a different (and now building-aware) scatter.
-  const { colliders: structures, footprints: structureFootprints } =
-    buildStructures(scene, rand, ZONE)
-  const treeColliders = scatterVegetation(scene, rand, structureFootprints)
+  const { colliders: structures, footprints: structureFootprints, safehouse } =
+    buildStructures(scene, drand, ZONE)
+  const treeColliders = scatterVegetation(scene, drand, structureFootprints)
 
   // -- sightlines ------------------------------------------------------------
   // Foliage occludes optics but not radar, so trees are kept as a separate set:
@@ -842,15 +857,52 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
   crateColumn.position.set(ZONE.x, PAD_Y + 75, ZONE.z)
   scene.add(crateColumn)
 
-  // INBOUND -> SECURING -> CARRYING -> COMPLETE, or LOST if shot down laden
+  // -- safehouse beacon ------------------------------------------------------
+  // Stays dark until the pod is aboard: a hidden base that only signals when
+  // you need it, rather than a marker on the skyline the whole game.
+  const HOME_Y = safehouse.y
+  const homeColumn = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.6, 1.6, 150, 12, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: 0x21d07a, transparent: true, opacity: 0.12, side: THREE.DoubleSide,
+      depthWrite: false, blending: THREE.AdditiveBlending,
+    })
+  )
+  homeColumn.position.set(SAFEHOUSE.x, HOME_Y + 75, SAFEHOUSE.z)
+  homeColumn.visible = false
+  scene.add(homeColumn)
+
+  const homeGlow = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: glowTex, color: 0x21d07a, transparent: true, opacity: 0.5,
+    blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
+  }))
+  homeGlow.scale.setScalar(9)
+  homeGlow.position.set(SAFEHOUSE.x, HOME_Y + 4, SAFEHOUSE.z)
+  homeGlow.visible = false
+  scene.add(homeGlow)
+
+  // INBOUND -> SECURING -> CARRYING -> DELIVERING -> COMPLETE,
+  // or LOST if shot down laden
   let mission = 'INBOUND'
   let secure = 0
+  let deliver = 0
 
   function stowCrate() {
     crate.scale.setScalar(0.55)
     crate.position.set(0, -1.15, 0)
     crate.rotation.set(0, 0, 0)
     droneTilt.add(crate)
+    crateGlow.visible = false
+    crateColumn.visible = false
+  }
+
+  // pod winched down onto the safehouse pad
+  function dropCrate() {
+    droneTilt.remove(crate)
+    scene.add(crate)
+    crate.scale.setScalar(1)
+    crate.rotation.set(0, 0, 0)
+    crate.position.set(SAFEHOUSE.x, HOME_Y + 1.3, SAFEHOUSE.z)
     crateGlow.visible = false
     crateColumn.visible = false
   }
@@ -864,6 +916,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     crateGlow.visible = true
     crateColumn.visible = true
     secure = 0
+    deliver = 0
   }
 
   // -- rival drones ---------------------------------------------------------
@@ -972,7 +1025,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     sparkBurst(drone.position, 12, 0xffb060, 9)
     if (integrity <= 0) {
       playerDown = true
-      if (mission === 'CARRYING') {
+      if (mission === 'CARRYING' || mission === 'DELIVERING') {
         mission = 'LOST'
         returnCrate()
       }
@@ -1044,7 +1097,10 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
       setYaw: (v) => { yaw = v },
       getPos: () => drone.position.toArray(),
       getHits: () => hits,
-      getMission: () => ({ mission, secure, integrity: Math.round(integrity), down: playerDown }),
+      getMission: () => ({
+        mission, secure, deliver, integrity: Math.round(integrity), down: playerDown,
+      }),
+      safehouse: () => ({ x: SAFEHOUSE.x, y: HOME_Y, z: SAFEHOUSE.z }),
       getExposure: () => ({ threat, exposure: alertLevel, eyesOn, inCover, squad: squad.has }),
       getEnemyStates: () => enemies.map((e) => ({
         state: e.state, aware: +e.aware.toFixed(2), visible: e.visible,
@@ -1059,7 +1115,8 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
       enemyLos: () => enemies.map((e) => ({
         state: e.state,
         dist: +e.obj.position.distanceTo(drone.position).toFixed(1),
-        los: hasLineOfSight(e.obj.position, drone.position),
+        los: hasLineOfSight(e.obj.position, drone.position),   // fresh, right now
+        losCached: e.los,   // what the throttled sensor last sampled (<=120ms old)
         visible: e.visible,
         aware: +e.aware.toFixed(2),
       })),
@@ -1126,7 +1183,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
           e.visible = false
           e.inRange = false
         }
-        if (mission !== 'COMPLETE') { mission = 'INBOUND'; secure = 0 }
+        if (mission !== 'COMPLETE') { mission = 'INBOUND'; secure = 0; deliver = 0 }
       }
     }
 
@@ -1237,6 +1294,19 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
 
     // mission ---------------------------------------------------------------
     const padDist = Math.hypot(p.x - ZONE.x, p.z - ZONE.z)
+    const homeDist = Math.hypot(p.x - SAFEHOUSE.x, p.z - SAFEHOUSE.z)
+    const laden = mission === 'CARRYING' || mission === 'DELIVERING'
+
+    // the safehouse lights its beacon only while you are actually hauling
+    homeColumn.visible = laden
+    homeGlow.visible = laden
+    if (laden) {
+      const hp = 0.5 + 0.5 * Math.sin(t * 3)
+      homeColumn.material.opacity = 0.09 + 0.07 * hp
+      homeGlow.material.opacity = 0.35 + 0.3 * hp
+      homeGlow.scale.setScalar(8 + 2.5 * hp)
+    }
+
     if (mission === 'INBOUND' || mission === 'SECURING') {
       crate.rotation.y += 0.5 * dt
       crate.position.y = CRATE_HOME.y + Math.sin(t * 1.6) * 0.35
@@ -1262,11 +1332,29 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
         secure = Math.max(0, secure - dt * 0.7)
         if (secure === 0) mission = 'INBOUND'
       }
-    } else if (mission === 'CARRYING' && zoneDist > ZONE_SAFE &&
-               alertLevel < 0.05 && !squad.has) {
-      // clear only once the squad has genuinely lost you — outside the rim AND
-      // nobody still holding a contact. Hiding, not just sprinting, ends it.
-      mission = 'COMPLETE'
+    } else if (laden) {
+      // Hold over the safehouse pad, under its roof, to winch the pod down.
+      // Deliberately ungated on pursuit: breaking contact is now a survival
+      // problem, not a win condition — you can deliver hot if you can live
+      // through the trip.
+      const overPad = !playerDown && homeDist < DROP_R &&
+        p.y > HOME_Y && p.y - HOME_Y < DROP_CEIL
+      if (overPad) {
+        mission = 'DELIVERING'
+        deliver = Math.min(1, deliver + dt / DELIVER_TIME)
+        if (Math.random() < dt * 14) {
+          sparks.spawn(drone.position, new THREE.Vector3(
+            (Math.random() - 0.5) * 3, -1 - Math.random() * 2, (Math.random() - 0.5) * 3
+          ), { life: 0.4, s0: 1.2, s1: 0.1, o0: 0.9, color: 0x8fffc4, grav: 4 })
+        }
+        if (deliver >= 1) {
+          mission = 'COMPLETE'
+          dropCrate()
+        }
+      } else if (deliver > 0) {
+        deliver = Math.max(0, deliver - dt * 0.7)
+        if (deliver === 0) mission = 'CARRYING'
+      }
     }
 
     // -- rival sensors and AI ----------------------------------------------
@@ -1660,10 +1748,9 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
         inCover,
         mission,
         secure,
-        // inbound: how far to the pod. laden: how much further to break contact.
-        missionDist: mission === 'CARRYING'
-          ? Math.max(0, ZONE_SAFE - zoneDist)
-          : padDist,
+        deliver,
+        // inbound: how far to the pod. laden: how far home to the safehouse.
+        missionDist: laden ? homeDist : padDist,
         down: playerDown,
         recentDamage: t - lastDamage < 0.5,
       })
@@ -2266,6 +2353,109 @@ function addBlastRing(scene, out, mats, { x, z, r, terrainHeight }) {
   }
 }
 
+// A dug-in hangar: three walls, a roof, and a mouth facing west, away from the
+// threat axis — so anything chasing you in from hostile airspace is looking at
+// a solid back wall, and once you are inside every sightline but the mouth is
+// blocked. It draws no randomness at all, and world decoration now runs on its
+// own RNG stream, so neither this building nor any future scenery can re-roll
+// which line hardware is faulted.
+function buildSafehouse(scene, out, footprints, mats, SH) {
+  const y = terrainHeight(SH.x, SH.z)
+  const H = 9      // interior height
+  const HX = 12    // half span along x; the mouth is the -x face
+  const HZ = 9     // half span along z
+
+  const apron = new THREE.Mesh(
+    new THREE.BoxGeometry(HX * 2 + 18, 0.3, HZ * 2),
+    new THREE.MeshStandardMaterial({ color: 0x4a4d4f, roughness: 1 })
+  )
+  apron.position.set(SH.x - 9, y + 0.15, SH.z)
+  apron.receiveShadow = true
+  scene.add(apron)
+
+  // The collider set that makes the bay blind: back wall, two flanks, a roof.
+  // The walls are sunk SINK metres below the pad. The ground under this
+  // footprint varies by ~0.9 m, so basing them on the centre height alone left
+  // an 11 cm gap at the low corner — and a sightline is a zero-radius ray, so
+  // it goes straight through one. Sinking them makes that impossible whatever
+  // the terrain does.
+  const SINK = 3
+  addBox(scene, out, mats.conc, {
+    x: SH.x + HX - 0.5, z: SH.z, w: 1, d: HZ * 2, h: H + SINK, base: y - SINK,
+  })
+  for (const side of [-1, 1]) {
+    addBox(scene, out, mats.conc, {
+      x: SH.x, z: SH.z + side * (HZ - 0.5), w: HX * 2, d: 1, h: H + SINK, base: y - SINK,
+    })
+  }
+  addBox(scene, out, mats.roof, { x: SH.x, z: SH.z, w: HX * 2, d: HZ * 2, h: 0.8, base: y + H })
+
+  // landing pad and guide ring
+  const pad = new THREE.Mesh(
+    new THREE.CylinderGeometry(5.5, 5.5, 0.35, 24),
+    new THREE.MeshStandardMaterial({ color: 0x23282c, roughness: 0.9 })
+  )
+  pad.position.set(SH.x, y + 0.4, SH.z)
+  pad.receiveShadow = true
+  scene.add(pad)
+  const ring = new THREE.Mesh(
+    new THREE.TorusGeometry(5.2, 0.16, 6, 40),
+    new THREE.MeshBasicMaterial({ color: 0x21d07a })
+  )
+  ring.rotation.x = Math.PI / 2
+  ring.position.set(SH.x, y + 0.62, SH.z)
+  scene.add(ring)
+
+  // approach lights leading west out of the mouth, each on a short post
+  const lampMat = new THREE.MeshBasicMaterial({ color: 0x21d07a })
+  for (let i = 1; i <= 5; i++) {
+    for (const side of [-1, 1]) {
+      const lx = SH.x - HX - i * 7
+      const lz = SH.z + side * (HZ - 1.5)
+      const ly = terrainHeight(lx, lz)
+      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.14, 1.4, 5), mats.dark)
+      post.position.set(lx, ly + 0.7, lz)
+      scene.add(post)
+      const l = new THREE.Mesh(new THREE.SphereGeometry(0.3, 8, 6), lampMat)
+      l.position.set(lx, ly + 1.55, lz)
+      scene.add(l)
+    }
+  }
+
+  // roof antenna
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.3, 12, 6), mats.dark)
+  mast.position.set(SH.x + HX - 3, y + H + 6.8, SH.z - HZ + 3)
+  mast.castShadow = true
+  scene.add(mast)
+
+  // fuel drums stacked outside, clear of the bay
+  for (const [dx, dz] of [[HX + 3.5, -HZ + 2], [HX + 3.5, -HZ + 4.6], [HX + 6, -HZ + 3.3]]) {
+    addCyl(scene, out, mats.rust, {
+      x: SH.x + dx, z: SH.z + dz, r: 1.1, h: 2.4,
+      base: terrainHeight(SH.x + dx, SH.z + dz),
+    })
+  }
+
+  // windsock by the approach
+  const px = SH.x - HX - 5
+  const pz = SH.z + HZ + 3
+  const py = terrainHeight(px, pz)
+  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.22, 9, 6), mats.dark)
+  pole.position.set(px, py + 4.5, pz)
+  pole.castShadow = true
+  scene.add(pole)
+  const sock = new THREE.Mesh(
+    new THREE.ConeGeometry(0.9, 3.2, 8, 1, true),
+    new THREE.MeshStandardMaterial({ color: 0xff7a1a, roughness: 0.9, side: THREE.DoubleSide })
+  )
+  sock.position.set(px + 1.7, py + 8.7, pz)
+  sock.rotation.z = -Math.PI / 2
+  scene.add(sock)
+
+  footprints.push({ x: SH.x, z: SH.z, r: 36 })
+  return { x: SH.x, z: SH.z, y }
+}
+
 function buildStructures(scene, rand, ZONE_ARG) {
   const out = []
   const footprints = []   // plots that vegetation must keep out of
@@ -2381,7 +2571,9 @@ function buildStructures(scene, rand, ZONE_ARG) {
     placed++
   }
 
-  return { colliders: out, footprints, padY }
+  const safehouse = buildSafehouse(scene, out, footprints, mats, SAFEHOUSE)
+
+  return { colliders: out, footprints, padY, safehouse }
 }
 
 // shortest distance from a point to the shape's surface (0 when inside)

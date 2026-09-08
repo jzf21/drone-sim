@@ -47,6 +47,7 @@ canvas { display: block; width: 100%; height: 100%; }
 .mission-line.lost { color: #ff5252; }
 .mission .hint { margin-top: 6px; }
 .progress .bar.securing { background: #35e0ff; transition: none; }
+.progress .bar.delivering { background: #21d07a; transition: none; }
 
 /* -- exposure / stealth panel ---------------------------------------------- */
 .exposure { width: 320px; border-color: rgba(53, 224, 255, 0.25); }
