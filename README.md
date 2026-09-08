@@ -21,9 +21,22 @@ Open http://localhost:5173 and click the page to give it keyboard focus.
 | W / A / S / D | Move forward / left / back / right |
 | Space / Shift | Ascend / descend |
 | Q / E or ← / → | Yaw |
+| R | Redeploy after being shot down |
 
 Fly within the cyan scan ring of line hardware to log it. Green = OK,
 red = needs service (blinks in the scene, reason shown in the inspection log).
+
+## World
+
+- Rolling hills with a flat powerline corridor, distant mountain ring, pond,
+  trees, bushes and rocks — all collidable (terrain, towers, wires, trees),
+  with bounce physics, camera shake and an obstacle proximity warning.
+- A mountain with a waterfall cascading into a plunge pool, feeding a river
+  that winds across the hills into the pond.
+- A hostile airspace zone (red perimeter, southeast beyond the pond): enter it
+  and rival drones scramble from their base and open fire. Watch the INTEGRITY
+  bar — collisions and hits drain it; at 0% you're down (press R to redeploy).
+  Integrity slowly regenerates once you're clear of the zone.
 
 ## Credits
 

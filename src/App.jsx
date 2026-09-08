@@ -59,12 +59,34 @@ export default function App() {
           <div className="telem-row small">
             <span>IMPACTS</span><b>{telem.hits}</b>
           </div>
+          <div className="progress">
+            <div
+              className="bar"
+              style={{
+                width: `${telem.integrity}%`,
+                background: telem.integrity > 50 ? '#21d07a' : telem.integrity > 25 ? '#ffb020' : '#ff5252',
+              }}
+            />
+          </div>
+          <div className="telem-row small">
+            <span>INTEGRITY</span><b>{telem.integrity}%</b>
+          </div>
           {telem.nearest && !telem.nearest.detected && (
             <div className="nearest">nearest target: {telem.nearest.dist.toFixed(0)} m</div>
           )}
         </div>
       )}
 
+      {telem && telem.down && (
+        <div className="hud down-overlay">
+          <div className="down-title">DRONE DOWN</div>
+          <div className="down-sub">airframe destroyed — press <b>R</b> to redeploy</div>
+        </div>
+      )}
+      {telem && telem.hostile && !telem.down && (
+        <div className="hud zone-banner">☠ HOSTILE AIRSPACE — RIVAL DRONES ENGAGING</div>
+      )}
+      {telem && telem.recentDamage && !telem.down && <div className="hud damage-vignette" />}
       {telem && telem.recentHit && (
         <div className="hud warn-banner hit">✦ COLLISION ✦</div>
       )}
