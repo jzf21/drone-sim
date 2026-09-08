@@ -905,6 +905,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
       losT: i * 0.04,         // staggered so the three LOS checks land on
       los: false,             // different frames
       visible: false,
+      inRange: false,
     })
   }
 
@@ -1123,6 +1124,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
           e.searchT = 0
           e.los = false
           e.visible = false
+          e.inRange = false
         }
         if (mission !== 'COMPLETE') { mission = 'INBOUND'; secure = 0 }
       }
@@ -1295,7 +1297,17 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
       const dist = TMP_DIR.length()
       let visible = false
       let boresight = 0
-      if (!playerDown && dist > 0.01 && dist < SENSE_RANGE) {
+      const inRange = !playerDown && dist > 0.01 && dist < SENSE_RANGE
+      if (inRange) {
+        // The sightline is tracked whenever you are in range, independent of
+        // where this drone happens to be looking. Seeing you needs both, but
+        // the HUD's IN COVER tag has to distinguish "a wall is hiding me" from
+        // "it just happens to be facing the other way".
+        e.losT -= dt
+        if (e.losT <= 0) {
+          e.losT = 0.12                   // ~8 Hz, staggered across the squad
+          e.los = hasLineOfSight(e.obj.position, playerEye)
+        }
         TMP_DIR.divideScalar(dist)
         // The cone constrains bearing only — their sensors gimbal in pitch, so
         // climbing directly overhead is not a way to disappear. Altitude still
@@ -1306,20 +1318,13 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
           : 1
         if (cosA > FOV_COS) {
           boresight = (cosA - FOV_COS) / (1 - FOV_COS)
-          e.losT -= dt
-          if (e.losT <= 0) {
-            e.losT = 0.12                 // ~8 Hz, staggered across the squad
-            e.los = hasLineOfSight(e.obj.position, playerEye)
-          }
           visible = e.los
-        } else {
-          e.los = false
-          e.losT = 0                      // re-test the moment you re-enter the cone
         }
       } else {
         e.los = false
         e.losT = 0
       }
+      e.inRange = inRange
       e.visible = visible
 
       if (visible) {
@@ -1478,20 +1483,25 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     alertLevel = squad.has ? squad.level : 0
     eyesOn = 0
     engaged = false
-    let nearestThreat = Infinity
+    let inRangeCount = 0
+    let blockedCount = 0
     for (const e of enemies) {
       if (e.aware > alertLevel) alertLevel = e.aware
       if (e.visible) eyesOn++
       if (e.state === 'PURSUE') engaged = true
-      nearestThreat = Math.min(nearestThreat, e.obj.position.distanceTo(drone.position))
+      if (e.inRange) {
+        inRangeCount++
+        if (!e.los) blockedCount++
+      }
     }
     threat = engaged ? 'ENGAGED'
       : eyesOn > 0 ? 'TRACKED'
       : alertLevel > 0.05 || squad.has ? 'SUSPECTED'
       : 'HIDDEN'
-    // "in cover" means something specific: a hostile is close enough to see you
-    // and every line to you is blocked. Being merely far away is not cover.
-    inCover = eyesOn === 0 && nearestThreat < SENSE_RANGE
+    // "In cover" means something specific: a hostile is close enough to see you
+    // and every line to it is physically blocked. Being far away is not cover,
+    // and neither is a drone that simply happens to be looking elsewhere.
+    inCover = inRangeCount > 0 && blockedCount === inRangeCount
 
     for (let i = projectiles.length - 1; i >= 0; i--) {
       const pr = projectiles[i]
