@@ -43,6 +43,7 @@ export default function App() {
       {telem && (
         <div className="hud panel top-right">
           <div className="telem-row"><span>ALT</span><b>{telem.y.toFixed(1)} m</b></div>
+          <div className="telem-row"><span>AGL</span><b>{telem.agl.toFixed(1)} m</b></div>
           <div className="telem-row"><span>SPD</span><b>{(telem.speed * 3.6).toFixed(0)} km/h</b></div>
           <div className="telem-row"><span>HDG</span><b>{telem.heading.toFixed(0)}° {headingLetter(telem.heading)}</b></div>
           <div className="telem-row"><span>POS</span><b>{telem.x.toFixed(0)}, {telem.z.toFixed(0)}</b></div>
@@ -55,10 +56,20 @@ export default function App() {
           <div className="telem-row small fault-count">
             <span>FAULTS</span><b>{telem.faults}</b>
           </div>
+          <div className="telem-row small">
+            <span>IMPACTS</span><b>{telem.hits}</b>
+          </div>
           {telem.nearest && !telem.nearest.detected && (
             <div className="nearest">nearest target: {telem.nearest.dist.toFixed(0)} m</div>
           )}
         </div>
+      )}
+
+      {telem && telem.recentHit && (
+        <div className="hud warn-banner hit">✦ COLLISION ✦</div>
+      )}
+      {telem && !telem.recentHit && telem.obstacle !== null && (
+        <div className="hud warn-banner">⚠ OBSTACLE {telem.obstacle.toFixed(1)} m</div>
       )}
 
       <div className="hud panel right-list">

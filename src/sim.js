@@ -11,6 +11,7 @@ const LINE_LEN = SPAN * (TOWERS - 1)
 const X0 = -LINE_LEN / 2
 const SCAN_RANGE = 18     // detection radius (m)
 const FAULT_RATE = 0.22
+const POND = { x: 260, z: 230, r: 55 }
 
 // deterministic RNG so faults are stable between reloads
 function mulberry32(seed) {
@@ -21,6 +22,27 @@ function mulberry32(seed) {
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296
   }
+}
+
+// -- terrain ---------------------------------------------------------------
+
+function fbm(x, z) {
+  let h = 0
+  h += Math.sin(x * 0.004 + 1.7) * Math.cos(z * 0.005 + 0.3) * 10
+  h += Math.sin(x * 0.011 + 4.2) * Math.cos(z * 0.009 + 2.1) * 5
+  h += Math.sin(x * 0.027 + 0.9) * Math.cos(z * 0.023 + 5.0) * 2.2
+  h += Math.sin(x * 0.061) * Math.cos(z * 0.055 + 1.2) * 0.9
+  return h
+}
+
+// hills fade to a flat corridor along the powerline (|z| small); pond carved out
+export function terrainHeight(x, z) {
+  const s = THREE.MathUtils.smoothstep(Math.abs(z), 35, 110)
+  let h = fbm(x, z) * s
+  const dx = x - POND.x
+  const dz = z - POND.z
+  h -= 14 * Math.exp(-(dx * dx + dz * dz) / (2 * POND.r * POND.r)) * s
+  return h
 }
 
 const FAULT_NOTES = {
@@ -40,9 +62,9 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
 
   const scene = new THREE.Scene()
   scene.background = new THREE.Color(0x8fc1e3)
-  scene.fog = new THREE.Fog(0x8fc1e3, 220, 900)
+  scene.fog = new THREE.Fog(0x8fc1e3, 250, 1400)
 
-  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2500)
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 3000)
   camera.position.set(X0 - 20, 30, 60)
 
   // -- lights ---------------------------------------------------------------
@@ -60,27 +82,61 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
   const groundTex = makeGroundTexture()
   groundTex.wrapS = groundTex.wrapT = THREE.RepeatWrapping
   groundTex.repeat.set(48, 48)
+  const groundGeo = new THREE.PlaneGeometry(4000, 4000, 220, 220)
+  groundGeo.rotateX(-Math.PI / 2)
+  {
+    const pos = groundGeo.attributes.position
+    for (let i = 0; i < pos.count; i++) {
+      pos.setY(i, terrainHeight(pos.getX(i), pos.getZ(i)))
+    }
+    groundGeo.computeVertexNormals()
+  }
   const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(4000, 4000),
+    groundGeo,
     new THREE.MeshStandardMaterial({ map: groundTex, roughness: 1 })
   )
-  ground.rotation.x = -Math.PI / 2
   ground.receiveShadow = true
   scene.add(ground)
 
-  // dirt access track under the line
+  // pond water
+  const water = new THREE.Mesh(
+    new THREE.CircleGeometry(POND.r * 0.92, 40),
+    new THREE.MeshStandardMaterial({
+      color: 0x2e6d8a, roughness: 0.15, metalness: 0.1,
+      transparent: true, opacity: 0.92,
+    })
+  )
+  water.rotation.x = -Math.PI / 2
+  water.position.set(POND.x, terrainHeight(POND.x, POND.z) + 5.5, POND.z)
+  scene.add(water)
+
+  // dirt access track under the line (corridor is flat)
   const track = new THREE.Mesh(
     new THREE.PlaneGeometry(LINE_LEN + 220, 9),
     new THREE.MeshStandardMaterial({ color: 0x9d8a63, roughness: 1 })
   )
   track.rotation.x = -Math.PI / 2
-  track.position.y = 0.03
+  track.position.y = 0.05
   scene.add(track)
 
-  scatterTrees(scene, rand)
+  // distant mountain ring
+  {
+    const mat = new THREE.MeshStandardMaterial({ color: 0x62798b, roughness: 1, flatShading: true })
+    for (let i = 0; i < 26; i++) {
+      const a = (i / 26) * Math.PI * 2 + rand() * 0.2
+      const dist = 1000 + rand() * 500
+      const h = 110 + rand() * 150
+      const r = 130 + rand() * 150
+      const m = new THREE.Mesh(new THREE.ConeGeometry(r, h, 5 + Math.floor(rand() * 3)), mat)
+      m.position.set(Math.cos(a) * dist, h / 2 - 25, Math.sin(a) * dist)
+      m.rotation.y = rand() * Math.PI
+      scene.add(m)
+    }
+  }
+
+  const treeColliders = scatterVegetation(scene, rand)
 
   // -- inspectable parts registry ------------------------------------------
-  /** @type {Array<{id:string,type:string,label:string,status:'OK'|'FAULT',note:string,pos:THREE.Vector3,mats:THREE.MeshStandardMaterial[],detected:boolean}>} */
   const parts = []
 
   function registerPart(group, { id, type, label, towerRef }) {
@@ -111,12 +167,13 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
   const damperMat = new THREE.MeshStandardMaterial({ color: 0x22262a, metalness: 0.6, roughness: 0.5 })
   const spliceMat = new THREE.MeshStandardMaterial({ color: 0x8f9aa5, metalness: 0.9, roughness: 0.3 })
 
-  // arm level: [height, half width]
   const ARMS = [[28, 7.5], [34, 6.5], [40, 5.5]]
-  const attach = [] // attach[towerIdx] = array of Vector3 conductor attach points
+  const attach = []
+  const towerXs = []
 
   for (let t = 0; t < TOWERS; t++) {
     const x = X0 + t * SPAN
+    towerXs.push(x)
     const tower = buildTower(steel)
     tower.position.set(x, 0, 0)
     scene.add(tower)
@@ -136,13 +193,13 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
         pts.push(new THREE.Vector3(x, h - 3.2, side * hw))
       }
     })
-    // shield wire peaks
     pts.push(new THREE.Vector3(x, 45.6, -1.4))
     pts.push(new THREE.Vector3(x, 45.6, 1.4))
     attach.push(pts)
   }
 
-  // conductors between towers
+  // conductors between towers; sample points collected for collision checks
+  const wireSamples = []
   for (let s = 0; s < TOWERS - 1; s++) {
     for (let w = 0; w < attach[s].length; w++) {
       const a = attach[s][w]
@@ -157,9 +214,9 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
         wireMat
       )
       scene.add(tube)
+      for (let i = 0; i <= 48; i++) wireSamples.push(curve.getPoint(i / 48))
 
       if (!shield) {
-        // vibration dampers near each end of the span
         for (const tt of [0.05, 0.95]) {
           const d = buildDamper(damperMat)
           d.position.copy(curve.getPoint(tt))
@@ -172,7 +229,6 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
             towerRef: `Span ${s + 1}–${s + 2}`,
           })
         }
-        // splice sleeve mid-span on ~40% of conductors
         if (rand() < 0.4) {
           const sp = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 2.2, 10), spliceMat)
           sp.position.copy(curve.getPoint(0.5))
@@ -193,8 +249,8 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
   }
 
   // -- drone ----------------------------------------------------------------
-  const drone = new THREE.Group()          // yaw + position
-  const droneTilt = new THREE.Group()      // pitch/roll
+  const drone = new THREE.Group()
+  const droneTilt = new THREE.Group()
   drone.add(droneTilt)
   drone.position.set(X0 - 25, 26, 22)
   scene.add(drone)
@@ -262,9 +318,38 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
   }
   window.addEventListener('resize', onResize)
 
-  // -- loop -----------------------------------------------------------------
+  // -- collision state -------------------------------------------------------
   const vel = new THREE.Vector3()
-  let yaw = Math.PI / 2 // face down the line (+X)
+  let yaw = Math.PI / 2
+  let shake = 0
+  let hits = 0
+  let lastHit = -10
+
+  // n = collision normal pointing away from obstacle, push = penetration depth
+  function bounce(n, push, t) {
+    drone.position.addScaledVector(n, push)
+    const vn = vel.dot(n)
+    if (vn < 0) {
+      vel.addScaledVector(n, -vn * 1.35)
+      if (vn < -1.5 && t - lastHit > 0.6) {
+        hits++
+        lastHit = t
+        shake = Math.min(shake + 0.7, 1.2)
+      } else {
+        shake = Math.min(shake + 0.2, 1.2)
+      }
+    }
+  }
+
+  if (typeof window !== 'undefined' && location.hostname === 'localhost') {
+    window.__droneDebug = {
+      setPos: (x, y, z) => drone.position.set(x, y, z),
+      getPos: () => drone.position.toArray(),
+      getHits: () => hits,
+    }
+  }
+
+  // -- loop -----------------------------------------------------------------
   const up = new THREE.Vector3(0, 1, 0)
   const clock = new THREE.Clock()
   let telemAcc = 0
@@ -295,8 +380,65 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     vel.multiplyScalar(Math.exp(-2.2 * dt))
     if (vel.length() > 26) vel.setLength(26)
     drone.position.addScaledVector(vel, dt)
-    drone.position.y = THREE.MathUtils.clamp(drone.position.y, 1.2, 140)
+    drone.position.y = Math.min(drone.position.y, 140)
     drone.rotation.y = yaw
+
+    // collisions -----------------------------------------------------------
+    let obstacle = Infinity
+    const p = drone.position
+
+    // terrain / water surface
+    const groundY = Math.max(terrainHeight(p.x, p.z), water.position.y - 2) + 1.1
+    if (p.y < groundY) {
+      p.y = groundY
+      if (vel.y < 0) {
+        if (vel.y < -3 && t - lastHit > 0.6) { hits++; lastHit = t; shake = Math.min(shake + 0.6, 1.2) }
+        vel.y = -vel.y * 0.3
+      }
+    }
+    // towers (tapered square body approximated as tapered cylinder)
+    for (const tx of towerXs) {
+      const dx = p.x - tx
+      const dz = p.z
+      const dHoriz = Math.sqrt(dx * dx + dz * dz)
+      if (dHoriz > 30 || p.y > 48) continue
+      const bodyR = THREE.MathUtils.lerp(5.9, 1.6, THREE.MathUtils.clamp(p.y / 45, 0, 1)) + 1.2
+      obstacle = Math.min(obstacle, dHoriz - bodyR)
+      if (dHoriz < bodyR) {
+        const inv = 1 / Math.max(dHoriz, 0.001)
+        bounce(new THREE.Vector3(dx * inv, 0, dz * inv), bodyR - dHoriz, t)
+      }
+    }
+
+    // wires (only bother near the corridor at conductor heights)
+    if (Math.abs(p.z) < 24 && p.y > 14 && Math.abs(p.x) < LINE_LEN / 2 + 40) {
+      const hitR = 1.0
+      for (const wp of wireSamples) {
+        const dx = p.x - wp.x
+        if (dx > 8 || dx < -8) continue
+        const dy = p.y - wp.y
+        const dz = p.z - wp.z
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz)
+        obstacle = Math.min(obstacle, d - 0.1)
+        if (d < hitR) {
+          const inv = 1 / Math.max(d, 0.001)
+          bounce(new THREE.Vector3(dx * inv, dy * inv, dz * inv), hitR - d, t)
+        }
+      }
+    }
+
+    // trees
+    for (const tc of treeColliders) {
+      const dx = p.x - tc.x
+      const dz = p.z - tc.z
+      if (dx > 12 || dx < -12 || dz > 12 || dz < -12 || p.y > tc.top) continue
+      const dHoriz = Math.sqrt(dx * dx + dz * dz)
+      obstacle = Math.min(obstacle, dHoriz - tc.r)
+      if (dHoriz < tc.r) {
+        const inv = 1 / Math.max(dHoriz, 0.001)
+        bounce(new THREE.Vector3(dx * inv, 0, dz * inv), tc.r - dHoriz, t)
+      }
+    }
 
     // tilt with acceleration
     const fSpd = vel.dot(forward)
@@ -306,32 +448,38 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     droneTilt.position.y = Math.sin(t * 2.1) * 0.06
     for (const r of rotors) r.rotation.y += 45 * dt
 
-    // camera chase ---------------------------------------------------------
+    // camera chase + impact shake ------------------------------------------
     const camTarget = drone.position.clone().addScaledVector(forward, -13).add(new THREE.Vector3(0, 5.5, 0))
     camera.position.lerp(camTarget, 1 - Math.exp(-4 * dt))
     camera.lookAt(drone.position.clone().addScaledVector(forward, 6))
+    if (shake > 0.005) {
+      camera.position.x += (Math.random() - 0.5) * shake
+      camera.position.y += (Math.random() - 0.5) * shake
+      camera.position.z += (Math.random() - 0.5) * shake
+      shake *= Math.exp(-3.5 * dt)
+    }
 
     // scanning -------------------------------------------------------------
     ringMat.opacity = 0.2 + 0.15 * Math.sin(t * 3)
     let nearest = null
     let nearestD = Infinity
-    for (const p of parts) {
-      const d = p.pos.distanceTo(drone.position)
-      if (d < nearestD) { nearestD = d; nearest = p }
-      if (!p.detected && d < SCAN_RANGE) {
-        p.detected = true
-        const c = p.status === 'FAULT' ? 0xff3b30 : 0x21d07a
-        for (const m of p.mats) {
+    for (const part of parts) {
+      const d = part.pos.distanceTo(drone.position)
+      if (d < nearestD) { nearestD = d; nearest = part }
+      if (!part.detected && d < SCAN_RANGE) {
+        part.detected = true
+        const c = part.status === 'FAULT' ? 0xff3b30 : 0x21d07a
+        for (const m of part.mats) {
           m.emissive.setHex(c)
           m.emissiveIntensity = 0.9
         }
         onDetect?.({
-          id: p.id, type: p.label, status: p.status, note: p.note,
-          towerRef: p.towerRef, x: p.pos.x, z: p.pos.z,
+          id: part.id, type: part.label, status: part.status, note: part.note,
+          towerRef: part.towerRef, x: part.pos.x, z: part.pos.z,
         })
       }
-      if (p.detected && p.status === 'FAULT') {
-        for (const m of p.mats) m.emissiveIntensity = 0.6 + 0.5 * Math.sin(t * 6)
+      if (part.detected && part.status === 'FAULT') {
+        for (const m of part.mats) m.emissiveIntensity = 0.6 + 0.5 * Math.sin(t * 6)
       }
     }
     if (nearest && nearestD < SCAN_RANGE * 1.6) {
@@ -345,15 +493,19 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     telemAcc += dt
     if (telemAcc > 0.12) {
       telemAcc = 0
-      const scanned = parts.filter((p) => p.detected)
+      const scanned = parts.filter((x) => x.detected)
       onTelemetry?.({
-        x: drone.position.x, y: drone.position.y, z: drone.position.z,
+        x: p.x, y: p.y, z: p.z,
+        agl: p.y - terrainHeight(p.x, p.z),
         speed: vel.length(),
         heading: ((-yaw * 180) / Math.PI + 90 + 360) % 360,
         scanned: scanned.length,
         total: parts.length,
-        faults: scanned.filter((p) => p.status === 'FAULT').length,
+        faults: scanned.filter((x) => x.status === 'FAULT').length,
         nearest: nearest ? { id: nearest.id, dist: nearestD, detected: nearest.detected } : null,
+        obstacle: obstacle < 10 ? obstacle : null,
+        hits,
+        recentHit: t - lastHit < 1,
       })
     }
 
@@ -401,11 +553,9 @@ function buildTower(mat) {
     ]
   }
 
-  // legs
   const bot = corners(0), top = corners(H)
   for (let i = 0; i < 4; i++) g.add(beam(bot[i], top[i], 0.22, mat))
 
-  // horizontal + diagonal bracing every 7.5 m
   for (let y = 0; y < H; y += 7.5) {
     const c1 = corners(y), c2 = corners(Math.min(y + 7.5, H))
     for (let i = 0; i < 4; i++) {
@@ -416,7 +566,6 @@ function buildTower(mat) {
     }
   }
 
-  // cross arms
   for (const [h, hwArm] of [[28, 7.5], [34, 6.5], [40, 5.5]]) {
     const w = hw(h)
     for (const side of [-1, 1]) {
@@ -427,7 +576,6 @@ function buildTower(mat) {
     }
   }
 
-  // peak for shield wires
   const apex = new THREE.Vector3(0, 46, 0)
   const tc = corners(H)
   for (const c of tc) g.add(beam(c, apex, 0.1, mat))
@@ -527,27 +675,80 @@ function makeGroundTexture() {
   return tex
 }
 
-function scatterTrees(scene, rand) {
-  const N = 140
-  const trunkGeo = new THREE.CylinderGeometry(0.35, 0.5, 4, 6)
-  const folGeo = new THREE.ConeGeometry(3, 8, 8)
-  const trunkMat = new THREE.MeshStandardMaterial({ color: 0x6b4a2e, roughness: 1 })
-  const folMat = new THREE.MeshStandardMaterial({ color: 0x35602f, roughness: 1 })
-  const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, N)
-  const fols = new THREE.InstancedMesh(folGeo, folMat, N)
+function scatterVegetation(scene, rand) {
+  const colliders = []
   const m = new THREE.Matrix4()
-  for (let i = 0; i < N; i++) {
-    let x, z
-    do {
-      x = (rand() - 0.5) * (LINE_LEN + 500)
-      z = (rand() - 0.5) * 700
-    } while (Math.abs(z) < 30) // keep the powerline corridor clear
-    const s = 0.7 + rand() * 1.2
-    m.makeScale(s, s, s).setPosition(x, 2 * s, z)
-    trunks.setMatrixAt(i, m)
-    m.makeScale(s, s, s).setPosition(x, 7.5 * s, z)
-    fols.setMatrixAt(i, m)
+
+  const nearPond = (x, z) => {
+    const dx = x - POND.x, dz = z - POND.z
+    return dx * dx + dz * dz < (POND.r + 25) * (POND.r + 25)
   }
-  fols.castShadow = true
-  scene.add(trunks, fols)
+
+  // trees (collidable)
+  {
+    const N = 160
+    const trunks = new THREE.InstancedMesh(
+      new THREE.CylinderGeometry(0.35, 0.5, 4, 6),
+      new THREE.MeshStandardMaterial({ color: 0x6b4a2e, roughness: 1 }), N)
+    const fols = new THREE.InstancedMesh(
+      new THREE.ConeGeometry(3, 8, 8),
+      new THREE.MeshStandardMaterial({ color: 0x35602f, roughness: 1 }), N)
+    for (let i = 0; i < N; i++) {
+      let x, z
+      do {
+        x = (rand() - 0.5) * (LINE_LEN + 500)
+        z = (rand() - 0.5) * 700
+      } while (Math.abs(z) < 30 || nearPond(x, z))
+      const s = 0.7 + rand() * 1.2
+      const y = terrainHeight(x, z)
+      m.makeScale(s, s, s).setPosition(x, y + 2 * s, z)
+      trunks.setMatrixAt(i, m)
+      m.makeScale(s, s, s).setPosition(x, y + 7.5 * s, z)
+      fols.setMatrixAt(i, m)
+      colliders.push({ x, z, r: 2.6 * s, top: y + 11.5 * s })
+    }
+    fols.castShadow = true
+    scene.add(trunks, fols)
+  }
+
+  // bushes
+  {
+    const N = 180
+    const bushes = new THREE.InstancedMesh(
+      new THREE.IcosahedronGeometry(1.4, 0),
+      new THREE.MeshStandardMaterial({ color: 0x476b33, roughness: 1, flatShading: true }), N)
+    for (let i = 0; i < N; i++) {
+      let x, z
+      do {
+        x = (rand() - 0.5) * (LINE_LEN + 500)
+        z = (rand() - 0.5) * 700
+      } while (nearPond(x, z))
+      const s = 0.6 + rand() * 1.3
+      m.makeScale(s * 1.4, s * 0.8, s * 1.4).setPosition(x, terrainHeight(x, z) + 0.5 * s, z)
+      bushes.setMatrixAt(i, m)
+    }
+    scene.add(bushes)
+  }
+
+  // rocks
+  {
+    const N = 90
+    const rocks = new THREE.InstancedMesh(
+      new THREE.DodecahedronGeometry(1, 0),
+      new THREE.MeshStandardMaterial({ color: 0x8a8d8f, roughness: 1, flatShading: true }), N)
+    for (let i = 0; i < N; i++) {
+      let x, z
+      do {
+        x = (rand() - 0.5) * (LINE_LEN + 600)
+        z = (rand() - 0.5) * 800
+      } while (nearPond(x, z))
+      const s = 0.5 + rand() * 2.6
+      m.makeRotationY(rand() * Math.PI).scale(new THREE.Vector3(s, s * 0.7, s))
+        .setPosition(x, terrainHeight(x, z) + 0.3 * s, z)
+      rocks.setMatrixAt(i, m)
+    }
+    scene.add(rocks)
+  }
+
+  return colliders
 }
