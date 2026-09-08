@@ -1,9 +1,22 @@
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import { createAtmosphere } from './atmosphere.js'
+import { createPostFX } from './postfx.js'
 
 // ---------------------------------------------------------------------------
 // Powerline inspection drone simulation
 // ---------------------------------------------------------------------------
+
+const START_HOUR = 17.8   // late afternoon: long shadows, warm key light
+const CYCLE_RATE = 0.08   // hours per second when the clock is running (~5 min/day)
+
+// Emissive markers are pushed above 1.0 so filmic tone mapping keeps them
+// saturated instead of washing them toward white, and so the bloom pass can
+// tell them apart from lit surfaces. Anything the sun lights tops out at 1.0,
+// which is exactly the bloom threshold, so only these glow.
+function hdr(hex, gain) {
+  return new THREE.Color(hex).multiplyScalar(gain)
+}
 
 const SPAN = 140          // distance between towers (m)
 const TOWERS = 7
@@ -125,77 +138,32 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   const drand = mulberry32(1337)
   const rand = mulberry32(4242)
 
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true })
+  // No `antialias` flag: the scene is rendered through a composer, where the
+  // canvas setting has no effect and the geometry pass carries its own MSAA.
+  const renderer = new THREE.WebGLRenderer({ canvas })
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
   renderer.setSize(window.innerWidth, window.innerHeight)
   renderer.shadowMap.enabled = true
   renderer.shadowMap.type = THREE.PCFSoftShadowMap
+  // Filmic response rather than a hard clip at white. The low sun, the beacons
+  // and the sun disc all overshoot 1.0 and need somewhere to roll off to.
+  renderer.toneMapping = THREE.ACESFilmicToneMapping
 
   const scene = new THREE.Scene()
-  scene.fog = new THREE.Fog(0xa9cbe0, 260, 1500)
 
   const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 3000)
   camera.position.set(X0 - 20, 30, 60)
 
-  // -- lights ---------------------------------------------------------------
-  scene.add(new THREE.HemisphereLight(0xcfe8ff, 0x3a5230, 0.9))
-  const sun = new THREE.DirectionalLight(0xfff2d9, 1.6)
-  sun.position.set(180, 260, 120)
-  sun.castShadow = true
-  sun.shadow.mapSize.set(2048, 2048)
-  const sc = sun.shadow.camera
-  // tight frustum that rides with the drone, so everything casts shadows
-  sc.left = -230; sc.right = 230; sc.top = 230; sc.bottom = -230
-  sc.near = 40; sc.far = 820
-  sun.shadow.bias = -0.0005
-  sun.shadow.normalBias = 0.5
-  scene.add(sun)
-  scene.add(sun.target)
-  const SUN_OFFSET = new THREE.Vector3(180, 260, 120)
-  const SUN_DIR = SUN_OFFSET.clone().normalize()
+  const fx = createPostFX(renderer, scene, camera)
+
+  // Sky, sun, moon, hemisphere fill, fog, exposure and the environment map that
+  // every metal in the scene reflects all hang off one clock. See atmosphere.js.
+  const atmos = createAtmosphere(scene, renderer, { hour: START_HOUR })
+  const sun = atmos.sun
 
   const glowTex = makeGlowTexture()
 
-  // -- sky dome + drifting clouds -------------------------------------------
-  const sky = new THREE.Mesh(
-    new THREE.SphereGeometry(2500, 32, 16),
-    new THREE.ShaderMaterial({
-      side: THREE.BackSide, depthWrite: false, fog: false,
-      uniforms: {
-        zenith: { value: new THREE.Color(0x2458a0) },
-        horizon: { value: new THREE.Color(0xa9cbe0) },
-        haze: { value: new THREE.Color(0xcbd8dd) },
-        sunDir: { value: SUN_DIR },
-      },
-      vertexShader: `
-        varying vec3 vDir;
-        void main() {
-          vDir = position;
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }`,
-      fragmentShader: `
-        uniform vec3 zenith;
-        uniform vec3 horizon;
-        uniform vec3 haze;
-        uniform vec3 sunDir;
-        varying vec3 vDir;
-        void main() {
-          vec3 d = normalize(vDir);
-          vec3 c = mix(horizon, zenith, smoothstep(0.0, 0.55, d.y));
-          c = mix(haze, c, smoothstep(-0.18, 0.04, d.y));
-          float s = max(dot(d, sunDir), 0.0);
-          c += vec3(1.0, 0.94, 0.78) * pow(s, 900.0) * 1.5;   // sun disc
-          c += vec3(1.0, 0.88, 0.66) * pow(s, 14.0) * 0.20;   // halo
-          gl_FragColor = vec4(c, 1.0);
-          #include <tonemapping_fragment>
-          #include <colorspace_fragment>
-        }`,
-    })
-  )
-  sky.renderOrder = -1
-  sky.frustumCulled = false
-  scene.add(sky)
-
+  // -- drifting clouds ------------------------------------------------------
   const CLOUD_SPREAD = 2400
   const clouds = new THREE.Group()
   {
@@ -205,8 +173,10 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
       const sp = new THREE.Sprite(new THREE.SpriteMaterial({
         map: cloudTex, transparent: true, depthWrite: false, fog: false,
         opacity: 0.6 + crand() * 0.35,
-        color: new THREE.Color().setHSL(0.58, 0.1, 0.96 + crand() * 0.03),
       }))
+      // Held rather than baked into the colour: the deck is re-tinted every
+      // frame from the sky, and this is each sprite's share of that tint.
+      sp.userData.tint = 0.9 + crand() * 0.14
       const w = 240 + crand() * 400
       sp.scale.set(w, w * (0.34 + crand() * 0.16), 1)
       // half the deck sits low enough to enter the chase camera's frame
@@ -280,8 +250,14 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   scene.add(ground)
 
   // -- waterway: pond, river, plunge pool, waterfall ------------------------
+  // Water is now mostly reflection rather than colour: the environment map
+  // carries the sky, the normal map ripples it, and the base colour only shows
+  // where the surface faces away from anything bright.
+  const pondNormals = makeWaterNormalTexture()
+  pondNormals.repeat.set(6, 6)
   const waterMat = new THREE.MeshStandardMaterial({
-    color: 0x2e6d8a, roughness: 0.15, metalness: 0.1,
+    color: 0x14313f, roughness: 0.06, metalness: 0.25,
+    normalMap: pondNormals, normalScale: new THREE.Vector2(0.6, 0.6),
     transparent: true, opacity: 0.92,
   })
 
@@ -309,8 +285,11 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
 
   const riverTex = makeWaterTexture()
   riverTex.wrapS = riverTex.wrapT = THREE.RepeatWrapping
+  const riverNormals = makeWaterNormalTexture()
+  riverNormals.repeat.set(2, 3)
   const riverMat = new THREE.MeshStandardMaterial({
-    color: 0x3f7f9e, map: riverTex, roughness: 0.2, metalness: 0.05,
+    color: 0x1d4d63, map: riverTex, roughness: 0.09, metalness: 0.2,
+    normalMap: riverNormals, normalScale: new THREE.Vector2(0.8, 0.8),
     transparent: true, opacity: 0.9,
   })
   {
@@ -668,12 +647,12 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     const mk = (hex, x, z, r) => {
       const bulb = new THREE.Mesh(
         new THREE.SphereGeometry(r, 8, 6),
-        new THREE.MeshBasicMaterial({ color: hex })
+        new THREE.MeshBasicMaterial({ color: hdr(hex, 3.2) })
       )
       bulb.position.set(x, -0.15, z)
       droneTilt.add(bulb)
       const halo = new THREE.Sprite(new THREE.SpriteMaterial({
-        map: glowTex, color: hex, transparent: true, opacity: 0.55,
+        map: glowTex, color: hdr(hex, 2.2), transparent: true, opacity: 0.55,
         blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
       }))
       halo.scale.setScalar(r * 5)
@@ -689,7 +668,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   const strobeHalo = navLights[2].halo
 
   // -- particle pools: sparks, smoke ----------------------------------------
-  function makePool(n, texture, blending, useFog) {
+  function makePool(n, texture, blending, useFog, gain = 1) {
     const items = []
     for (let i = 0; i < n; i++) {
       const sp = new THREE.Sprite(new THREE.SpriteMaterial({
@@ -710,7 +689,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
         it.vel.copy(vel)
         it.life = it.max = o.life
         it.s0 = o.s0; it.s1 = o.s1; it.o0 = o.o0; it.grav = o.grav || 0
-        it.sp.material.color.setHex(o.color)
+        it.sp.material.color.setHex(o.color).multiplyScalar(gain)
         it.sp.material.opacity = o.o0
         it.sp.scale.set(o.s0, o.s0, 1)
       },
@@ -730,7 +709,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     }
   }
 
-  const sparks = makePool(140, glowTex, THREE.AdditiveBlending, false)
+  const sparks = makePool(140, glowTex, THREE.AdditiveBlending, false, 3.0)
   const smoke = makePool(80, makeMistTexture(), THREE.NormalBlending, true)
   const sparkVel = new THREE.Vector3()
 
@@ -749,6 +728,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   let smokeAcc = 0
 
   // -- hostile territory ----------------------------------------------------
+  const BEACON_GAIN = 3.0   // lit; the dark half of the blink drops back under 1
   const beaconMats = []
   {
     const wall = new THREE.Mesh(
@@ -763,7 +743,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
 
     const rim = new THREE.Mesh(
       new THREE.TorusGeometry(ZONE.r, 0.9, 6, 96),
-      new THREE.MeshBasicMaterial({ color: 0xff2a2a, transparent: true, opacity: 0.5 })
+      new THREE.MeshBasicMaterial({ color: hdr(0xff2a2a, 1.8), transparent: true, opacity: 0.5 })
     )
     rim.rotation.x = Math.PI / 2
     rim.position.set(ZONE.x, 118, ZONE.z)
@@ -779,7 +759,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
       const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.35, 14, 6), poleMat)
       pole.position.set(px, py + 7, pz)
       scene.add(pole)
-      const lampMat = new THREE.MeshBasicMaterial({ color: 0xff2a2a })
+      const lampMat = new THREE.MeshBasicMaterial({ color: hdr(0xff2a2a, BEACON_GAIN) })
       const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.9, 10, 8), lampMat)
       lamp.position.set(px, py + 14.6, pz)
       scene.add(lamp)
@@ -804,7 +784,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.5, 26, 6), poleMat)
     mast.position.set(ZONE.x + 24, padY + 13, ZONE.z - 6)
     scene.add(mast)
-    const mastLampMat = new THREE.MeshBasicMaterial({ color: 0xff2a2a })
+    const mastLampMat = new THREE.MeshBasicMaterial({ color: hdr(0xff2a2a, BEACON_GAIN) })
     const mastLamp = new THREE.Mesh(new THREE.SphereGeometry(1.1, 10, 8), mastLampMat)
     mastLamp.position.set(ZONE.x + 24, padY + 26.5, ZONE.z - 6)
     scene.add(mastLamp)
@@ -823,7 +803,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     )
     shell.castShadow = true
     crate.add(shell)
-    const trimMat = new THREE.MeshBasicMaterial({ color: 0x35e0ff })
+    const trimMat = new THREE.MeshBasicMaterial({ color: hdr(0x35e0ff, 3.5) })
     for (const [w, d] of [[2.5, 0.22], [0.22, 2.5]]) {
       const band = new THREE.Mesh(new THREE.BoxGeometry(w, 0.22, d), trimMat)
       crate.add(band)
@@ -839,7 +819,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   scene.add(crate)
 
   const crateGlow = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: glowTex, color: 0x35e0ff, transparent: true, opacity: 0.55,
+    map: glowTex, color: hdr(0x35e0ff, 2.6), transparent: true, opacity: 0.55,
     blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
   }))
   crateGlow.scale.setScalar(7)
@@ -850,7 +830,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   const crateColumn = new THREE.Mesh(
     new THREE.CylinderGeometry(1.6, 1.6, 150, 12, 1, true),
     new THREE.MeshBasicMaterial({
-      color: 0x35e0ff, transparent: true, opacity: 0.12, side: THREE.DoubleSide,
+      color: hdr(0x35e0ff, 3.0), transparent: true, opacity: 0.12, side: THREE.DoubleSide,
       depthWrite: false, blending: THREE.AdditiveBlending,
     })
   )
@@ -864,7 +844,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   const homeColumn = new THREE.Mesh(
     new THREE.CylinderGeometry(1.6, 1.6, 150, 12, 1, true),
     new THREE.MeshBasicMaterial({
-      color: 0x21d07a, transparent: true, opacity: 0.12, side: THREE.DoubleSide,
+      color: hdr(0x21d07a, 3.0), transparent: true, opacity: 0.12, side: THREE.DoubleSide,
       depthWrite: false, blending: THREE.AdditiveBlending,
     })
   )
@@ -873,7 +853,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   scene.add(homeColumn)
 
   const homeGlow = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: glowTex, color: 0x21d07a, transparent: true, opacity: 0.5,
+    map: glowTex, color: hdr(0x21d07a, 2.6), transparent: true, opacity: 0.5,
     blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
   }))
   homeGlow.scale.setScalar(9)
@@ -1002,9 +982,9 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   const projectiles = []
   const projGeom = new THREE.CylinderGeometry(0.11, 0.11, 3.2, 6)
   projGeom.rotateX(Math.PI / 2)   // long axis along +Z so lookAt() aims it
-  const projMat = new THREE.MeshBasicMaterial({ color: 0xffb060 })
+  const projMat = new THREE.MeshBasicMaterial({ color: hdr(0xffb060, 4.0) })
   const projHaloMat = new THREE.SpriteMaterial({
-    map: glowTex, color: 0xff5a28, transparent: true, opacity: 0.9,
+    map: glowTex, color: hdr(0xff5a28, 3.0), transparent: true, opacity: 0.9,
     blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
   })
   // Threat picture, recomputed each frame and read by the HUD and the debug hooks.
@@ -1033,7 +1013,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   }
 
   // scan range ring + beam
-  const ringMat = new THREE.LineBasicMaterial({ color: 0x35e0ff, transparent: true, opacity: 0.35 })
+  const ringMat = new THREE.LineBasicMaterial({ color: hdr(0x35e0ff, 2.5), transparent: true, opacity: 0.35 })
   const ring = new THREE.LineLoop(
     new THREE.BufferGeometry().setFromPoints(
       Array.from({ length: 64 }, (_, i) => {
@@ -1046,7 +1026,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   drone.add(ring)
 
   const beamGeom = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()])
-  const beam = new THREE.Line(beamGeom, new THREE.LineBasicMaterial({ color: 0x35e0ff, transparent: true, opacity: 0.8 }))
+  const beam = new THREE.Line(beamGeom, new THREE.LineBasicMaterial({ color: hdr(0x35e0ff, 2.5), transparent: true, opacity: 0.8 }))
   beam.visible = false
   scene.add(beam)
 
@@ -1055,6 +1035,12 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   const onKey = (e) => {
     if (e.repeat) return
     keys[e.code] = e.type === 'keydown'
+    if (e.type !== 'keydown') return
+    // Time of day is edge-triggered rather than polled in the frame loop: each
+    // press is one step, so holding the key does not run the clock away.
+    if (e.code === 'BracketLeft') atmos.setHour(atmos.hour - 0.5)
+    else if (e.code === 'BracketRight') atmos.setHour(atmos.hour + 0.5)
+    else if (e.code === 'Backslash') atmos.setCycle(atmos.cycling ? 0 : CYCLE_RATE)
   }
   window.addEventListener('keydown', onKey)
   window.addEventListener('keyup', onKey)
@@ -1063,6 +1049,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     camera.aspect = window.innerWidth / window.innerHeight
     camera.updateProjectionMatrix()
     renderer.setSize(window.innerWidth, window.innerHeight)
+    fx.setSize(window.innerWidth, window.innerHeight)
   }
   window.addEventListener('resize', onResize)
 
@@ -1290,7 +1277,8 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
 
     const blink = alertLevel > 0.5 ? 10 : alertLevel > 0.05 ? 6 : 3
     for (const lamp of beaconMats) {
-      lamp.color.setHex(Math.sin(t * blink) > 0 ? 0xff2a2a : 0x551111)
+      const lit = Math.sin(t * blink) > 0
+      lamp.color.setHex(lit ? 0xff2a2a : 0x551111).multiplyScalar(lit ? BEACON_GAIN : 1)
     }
 
     // mission ---------------------------------------------------------------
@@ -1654,13 +1642,17 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     strobeBulb.visible = strobeOn
     strobeHalo.material.opacity = strobeOn ? 1 : 0
 
-    // sun rides with the drone so the shadow frustum covers wherever we fly
-    sun.position.copy(p).add(SUN_OFFSET)
-    sun.target.position.set(p.x, terrainHeight(p.x, p.z), p.z)
+    atmos.update(dt, p, terrainHeight(p.x, p.z), camera.position)
+
+    // Ripples: the pond drifts in two directions at once so it never reads as
+    // a sliding texture; the river scrolls along its own flow axis.
+    pondNormals.offset.set(t * 0.010, t * 0.014)
+    riverNormals.offset.y = -t * 0.10
 
     for (const c of clouds.children) {
       c.position.x += c.userData.drift * dt
       if (c.position.x > CLOUD_SPREAD / 2) c.position.x -= CLOUD_SPREAD
+      c.material.color.copy(atmos.cloudColor).multiplyScalar(c.userData.tint)
     }
 
     // camera chase + impact shake ------------------------------------------
@@ -1686,7 +1678,9 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
         const c = part.status === 'FAULT' ? 0xff3b30 : 0x21d07a
         for (const m of part.mats) {
           m.emissive.setHex(c)
-          m.emissiveIntensity = 0.9
+          // Above 1 so scanned hardware still reads as marked after dark, and
+          // so the bloom pass haloes it the way the other beacons are haloed.
+          m.emissiveIntensity = 2.2
         }
         onDetect?.({
           id: part.id, type: part.label, status: part.status, note: part.note,
@@ -1695,7 +1689,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
         if (part.status === 'FAULT') {
           // corona glow marks the fault from well outside scan range
           part.glow = new THREE.Sprite(new THREE.SpriteMaterial({
-            map: glowTex, color: 0xff4a24, transparent: true, opacity: 0.6,
+            map: glowTex, color: hdr(0xff4a24, 2.5), transparent: true, opacity: 0.6,
             blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
           }))
           part.glow.position.copy(part.pos)
@@ -1703,7 +1697,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
         }
       }
       if (part.detected && part.status === 'FAULT') {
-        for (const m of part.mats) m.emissiveIntensity = 0.6 + 0.5 * Math.sin(t * 6)
+        for (const m of part.mats) m.emissiveIntensity = 1.7 + 1.2 * Math.sin(t * 6)
         const pulse = 0.5 + 0.5 * Math.sin(t * 6)
         part.glow.scale.setScalar(2.4 + 1.4 * pulse)
         part.glow.material.opacity = 0.35 + 0.35 * pulse
@@ -1754,12 +1748,11 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
         missionDist: laden ? homeDist : padDist,
         down: playerDown,
         recentDamage: t - lastDamage < 0.5,
+        tod: atmos.label,
       })
     }
 
-    sky.position.copy(camera.position)
-
-    renderer.render(scene, camera)
+    fx.render()
 
     // Safehouse waypoint. Projected after the render, so the camera matrices
     // are already current for this frame, and reported every frame rather than
@@ -1791,6 +1784,8 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
       window.removeEventListener('keydown', onKey)
       window.removeEventListener('keyup', onKey)
       window.removeEventListener('resize', onResize)
+      atmos.dispose()
+      fx.dispose()
       renderer.dispose()
     },
   }
@@ -1964,6 +1959,56 @@ function makeWaterTexture() {
     ctx.stroke()
   }
   return new THREE.CanvasTexture(c)
+}
+
+// A tileable tangent-space normal map built from a few summed sine waves.
+// Integer wave frequencies are what keep it seamless when the texture repeats.
+function makeWaterNormalTexture(size = 256, waves = 5) {
+  const c = document.createElement('canvas')
+  c.width = c.height = size
+  const ctx = c.getContext('2d')
+  const img = ctx.createImageData(size, size)
+
+  const W = []
+  for (let i = 0; i < waves; i++) {
+    const a = (i / waves) * Math.PI * 2 + 0.7
+    W.push({
+      fx: Math.round(Math.cos(a) * (1 + i)),
+      fz: Math.round(Math.sin(a) * (1 + i)),
+      amp: 1 / (1 + i),
+      ph: i * 1.7,
+    })
+  }
+  const height = (u, v) => {
+    let h = 0
+    for (const w of W) h += w.amp * Math.sin((u * w.fx + v * w.fz) * Math.PI * 2 + w.ph)
+    return h
+  }
+
+  const e = 1 / size
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size
+      const v = y / size
+      const du = (height(u + e, v) - height(u - e, v)) / (2 * e)
+      const dv = (height(u, v + e) - height(u, v - e)) / (2 * e)
+      const nx = -du * 0.012
+      const ny = -dv * 0.012
+      const len = Math.hypot(nx, ny, 1)
+      const i = (y * size + x) * 4
+      img.data[i] = ((nx / len) * 0.5 + 0.5) * 255
+      img.data[i + 1] = ((ny / len) * 0.5 + 0.5) * 255
+      img.data[i + 2] = (1 / len) * 255
+      img.data[i + 3] = 255
+    }
+  }
+  ctx.putImageData(img, 0, 0)
+
+  const tex = new THREE.CanvasTexture(c)
+  // Deliberately left in the default (non-sRGB) colour space: these bytes are
+  // vector components, not colour.
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping
+  return tex
 }
 
 function makeWaterfallTexture() {
@@ -2422,14 +2467,14 @@ function buildSafehouse(scene, out, footprints, mats, SH) {
   scene.add(pad)
   const ring = new THREE.Mesh(
     new THREE.TorusGeometry(5.2, 0.16, 6, 40),
-    new THREE.MeshBasicMaterial({ color: 0x21d07a })
+    new THREE.MeshBasicMaterial({ color: hdr(0x21d07a, 3.0) })
   )
   ring.rotation.x = Math.PI / 2
   ring.position.set(SH.x, y + 0.62, SH.z)
   scene.add(ring)
 
   // approach lights leading west out of the mouth, each on a short post
-  const lampMat = new THREE.MeshBasicMaterial({ color: 0x21d07a })
+  const lampMat = new THREE.MeshBasicMaterial({ color: hdr(0x21d07a, 3.0) })
   for (let i = 1; i <= 5; i++) {
     for (const side of [-1, 1]) {
       const lx = SH.x - HX - i * 7

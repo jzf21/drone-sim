@@ -22,6 +22,8 @@ Open http://localhost:5173 and click the page to give it keyboard focus.
 | Space / Shift | Ascend / descend |
 | Q / E or ← / → | Yaw |
 | R | Redeploy after being shot down |
+| [ / ] | Wind the clock back / forward 30 minutes |
+| \\ | Start or stop the day/night cycle (~5 min per day) |
 
 Fly within the cyan scan ring of line hardware to log it. Green = OK,
 red = needs service (blinks in the scene, reason shown in the inspection log).
@@ -121,3 +123,33 @@ What does not help:
 
 - Drone model: ["Drone" by NateGazzard](https://poly.pizza/m/DNbUoMtG3H) via poly.pizza (CC-BY)
 - Built with [Three.js](https://threejs.org/), [React](https://react.dev/) and [Vite](https://vitejs.dev/)
+
+## Lighting and time of day
+
+The sim starts at 17:48, late afternoon, and the entire look of the frame hangs
+off that one number. `src/atmosphere.js` holds a table of keyframes across the
+24-hour clock — NIGHT, PRE-DAWN, DAWN, MORNING, NOON, AFTERNOON, GOLDEN, DUSK,
+TWILIGHT — and interpolates between them, so `[` and `]` move the sun, recolour
+the key light, retint the cloud deck, thicken the haze and re-expose the frame
+together. `\\` runs the clock instead of stepping it. The current time shows in
+the telemetry panel.
+
+The sky is a single shader dome: a zenith-to-horizon gradient, a sun or moon
+disc, a warm band low on the sun's side that does most of the work of selling a
+low sun, and a lattice of stars that the haze washes out as the sky brightens.
+That same dome is baked to an environment map through `PMREMGenerator`, which is
+what the tower steel, splice sleeves, drone hull and water surfaces reflect —
+without it every metal in the scene has nothing to mirror and reads as flat grey.
+The bake is refreshed only when the clock has moved far enough to see.
+
+Rendering goes through a composer (`src/postfx.js`): the scene is drawn into a
+linear half-float buffer with 4x MSAA, bloomed, then tone mapped once at the end
+with ACES. The bloom threshold sits at 1.0 and every sunlit surface tops out
+there, so only things that are meant to be light sources — nav lights, perimeter
+beacons, the pod and safehouse columns, the scan ring, tracer rounds, the sun —
+are pushed above 1.0 and glow. That is why marker colours in `sim.js` go through
+`hdr(hex, gain)` rather than being plain hex.
+
+After dark the terrain stays flyable on hemisphere fill and moonlight, but the
+compound's red beacons and your own nav lights become the brightest things on
+the map, which changes how a night approach plays.

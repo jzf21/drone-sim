@@ -184,6 +184,7 @@ export default function App() {
           <div className="telem-row"><span>SPD</span><b>{(telem.speed * 3.6).toFixed(0)} km/h</b></div>
           <div className="telem-row"><span>HDG</span><b>{telem.heading.toFixed(0)}° {headingLetter(telem.heading)}</b></div>
           <div className="telem-row"><span>POS</span><b>{telem.x.toFixed(0)}, {telem.z.toFixed(0)}</b></div>
+          <div className="telem-row"><span>TIME</span><b>{telem.tod}</b></div>
           <div className="progress">
             <div className="bar" style={{ width: `${(telem.scanned / telem.total) * 100}%` }} />
           </div>
