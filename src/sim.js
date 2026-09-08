@@ -658,7 +658,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
       if (keys.KeyA) acc.sub(right)
       if (keys.Space) acc.y += 1
       if (keys.ShiftLeft || keys.ShiftRight) acc.y -= 1
-      if (acc.lengthSq() > 0) acc.normalize().multiplyScalar(38)
+      if (acc.lengthSq() > 0) acc.normalize().multiplyScalar(45.6)
       if (keys.KeyQ || keys.ArrowLeft) yaw += 1.6 * dt
       if (keys.KeyE || keys.ArrowRight) yaw -= 1.6 * dt
     } else {
@@ -676,7 +676,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
 
     vel.addScaledVector(acc, dt)
     vel.multiplyScalar(Math.exp(-2.2 * dt))
-    if (vel.length() > 26) vel.setLength(26)
+    if (vel.length() > 20.84) vel.setLength(20.84) // 75 km/h
     drone.position.addScaledVector(vel, dt)
     drone.position.y = Math.min(drone.position.y, 140)
     drone.rotation.y = yaw
@@ -771,7 +771,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
         if (sd < 8 && sd > 0.01) e.vel.addScaledVector(sep.normalize(), (8 - sd) * 2 * dt)
       }
       e.vel.multiplyScalar(Math.exp(-2 * dt))
-      const maxV = pursuing ? 22 : 12
+      const maxV = pursuing ? 19.5 : 12 // stays outrunnable at the new 75 km/h top speed
       if (e.vel.length() > maxV) e.vel.setLength(maxV)
       e.obj.position.addScaledVector(e.vel, dt)
       const floor = terrainHeight(e.obj.position.x, e.obj.position.z) + 6
