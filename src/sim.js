@@ -1052,6 +1052,16 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
       losTo: (x, y, z) => hasLineOfSight(drone.position, new THREE.Vector3(x, y, z)),
       structures: () => structures.length,
       getStructures: () => structures.map((sh) => ({ ...sh })),
+      getClock: () => ({ t: clock.elapsedTime, frames, radar: radar.angle }),
+      // per-rival ground truth: distance, whether the sightline is actually
+      // clear, and what the AI currently believes it can see
+      enemyLos: () => enemies.map((e) => ({
+        state: e.state,
+        dist: +e.obj.position.distanceTo(drone.position).toFixed(1),
+        los: hasLineOfSight(e.obj.position, drone.position),
+        visible: e.visible,
+        aware: +e.aware.toFixed(2),
+      })),
       setKey: (code, v) => { keys[code] = v },
     }
   }
@@ -1066,6 +1076,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
   const TMP_N = new THREE.Vector3()
   const clock = new THREE.Clock()
   let telemAcc = 0
+  let frames = 0
   let raf = 0
   let disposed = false
 
@@ -1074,6 +1085,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     raf = requestAnimationFrame(animate)
     const dt = Math.min(clock.getDelta(), 0.05)
     const t = clock.elapsedTime
+    frames++
 
     // movement -------------------------------------------------------------
     const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw))
@@ -1285,7 +1297,13 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
       let boresight = 0
       if (!playerDown && dist > 0.01 && dist < SENSE_RANGE) {
         TMP_DIR.divideScalar(dist)
-        const cosA = TMP_DIR.x * Math.sin(e.facing) + TMP_DIR.z * Math.cos(e.facing)
+        // The cone constrains bearing only — their sensors gimbal in pitch, so
+        // climbing directly overhead is not a way to disappear. Altitude still
+        // costs you below, through the detection-rate modifier.
+        const hlen = Math.hypot(TMP_DIR.x, TMP_DIR.z)
+        const cosA = hlen > 1e-3
+          ? (TMP_DIR.x * Math.sin(e.facing) + TMP_DIR.z * Math.cos(e.facing)) / hlen
+          : 1
         if (cosA > FOV_COS) {
           boresight = (cosA - FOV_COS) / (1 - FOV_COS)
           e.losT -= dt
@@ -2240,6 +2258,7 @@ function addBlastRing(scene, out, mats, { x, z, r, terrainHeight }) {
 
 function buildStructures(scene, rand, ZONE_ARG) {
   const out = []
+  const footprints = []   // plots that vegetation must keep out of
   const mats = structureMats()
   const gh = terrainHeight
 
@@ -2277,6 +2296,11 @@ function buildStructures(scene, rand, ZONE_ARG) {
     x: zx + 22, z: zz + 8, w: 12, d: 10, h: 8, base: gh(zx + 22, zz + 8), rot: 0.2,
   })
 
+  // Everything placed so far is compound; claim all of it plus the pad itself,
+  // so the enemy base does not end up with a forest growing through its apron.
+  for (const sh of out) footprints.push({ x: sh.x, z: sh.z, r: sh.bound + 4 })
+  footprints.push({ x: zx, z: zz, r: 26 })
+
   // -- map-wide structures --------------------------------------------------
   // Substation next to the corridor: transformer blocks + a control hut. Kept
   // off the wires so it reads as cover from the line without fouling the scan run.
@@ -2294,7 +2318,6 @@ function buildStructures(scene, rand, ZONE_ARG) {
   const KINDS = ['barn', 'warehouse', 'silo', 'tower', 'shed']
   let placed = 0
   let guard = 0
-  const footprints = []
   while (placed < 26 && guard++ < 4000) {
     const x = (rand() - 0.5) * (LINE_LEN + 620)
     const z = (rand() - 0.5) * 780

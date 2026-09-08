@@ -48,10 +48,54 @@ panel; no extra keys.
   drone so everything casts shadows.
 - Nav lights and a tail strobe on the airframe, corona glow and arc sparks on
   faulted hardware, tracer rounds, impact sparks and damage smoke.
-- A hostile airspace zone (red perimeter, southeast beyond the pond): enter it
-  and rival drones scramble from their base and open fire. Watch the INTEGRITY
-  bar — collisions and hits drain it; at 0% you're down (press R to redeploy).
-  Integrity slowly regenerates once you're clear of the zone.
+- Buildings everywhere: a fortified enemy compound (hangars, fuel tanks,
+  container stacks, a blast-wall ring around the pad, a radar mast) plus
+  warehouses, barns, silos and water towers scattered across the map, and
+  substations flanking the powerline corridor. All of it is solid — it blocks
+  movement, sightlines and gunfire, and the roofs are landable.
+- A hostile airspace zone (red perimeter, southeast beyond the pond). Crossing
+  the perimeter no longer gives you away by itself; it just puts you inside the
+  rivals' patrol envelope. Watch the INTEGRITY bar — collisions and hits drain
+  it; at 0% you're down (press R to redeploy). Integrity regenerates once the
+  squad has lost you.
+
+## Stealth — hiding from the rival drones
+
+The rivals have to actually see you. Each one carries an awareness meter that
+only fills while you are inside its sensor range, inside its forward-facing
+cone, and not behind something. The EXPOSURE panel reads that back:
+
+| State | Meaning |
+| --- | --- |
+| **UNDETECTED** | Nothing has eyes on you. |
+| **SEARCHING** | They are sweeping a last known position — yours or a radio call. |
+| **IN SIGHT** | Someone can see you and the lock is filling. Break line of sight. |
+| **LOCKED ON** | Weapons free. |
+
+What actually helps:
+
+- **Hard cover.** Hangars, silos, containers, blast walls and hillsides all
+  block their view *and* stop their rounds. Ducking behind a building drops the
+  drones that lose sight of you out of pursuit while the ones with a clear angle
+  keep shooting — so which side of the building you pick matters.
+- **Flying low and slow.** Speed and altitude both raise how fast they acquire
+  you. Hugging terrain buys real time; sprinting across open ground does not.
+- **Flanking.** Their sensor cone points forward and they can only turn so fast,
+  so coming in behind a patrolling drone works.
+
+What does not help:
+
+- **Trees.** They screen you from the drones' optics but the base radar sees
+  straight through foliage. Only buildings and terrain stop the radar sweep.
+- **Standing still after being spotted.** Losing line of sight sends them to
+  where you *were*, and the search orbit widens from there until it finds you.
+  Break contact, then relocate.
+- **Hiding from one drone.** A spotter radios your position to the others; they
+  will come and look, though only a drone's own eyes let it open fire.
+- **Grabbing the pod quietly.** The winch and the pod itself are loud —
+  detection rates rise sharply while securing and carrying, so the extraction is
+  where cover earns its keep. Getting clear now means genuinely losing them, not
+  just crossing back over the perimeter line.
 
 ## Credits
 
