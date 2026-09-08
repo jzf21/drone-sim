@@ -13,6 +13,11 @@ import * as THREE from 'three'
 // across the table; lerping wrapped angles would swing the sun backwards across
 // the sky between the last night key and the first dawn one.
 
+// One dial for the whole day: scales every keyframe's fog density. Lower is
+// clearer. Below about 0.25 the distant range stops reading as layered at all;
+// above about 0.7 the ridges lose their colour and flatten into the horizon.
+const HAZE = 0.4
+
 const DEG = Math.PI / 180
 const SUN_DIST = 338      // matches the length of the original fixed sun offset
 
@@ -239,7 +244,7 @@ const SKY_FRAG = `
 // ---------------------------------------------------------------------------
 
 /**
- * Owns everything the sun touches: the sky dome, both lights, the fog, the
+ * Owns everything the sun touches: the sky dome, both lights, the fog, the fog, the
  * environment map the metals reflect, and the tone-mapping exposure. Driving
  * `setHour` is the only way any of those should be changed.
  */
@@ -301,7 +306,7 @@ export function createAtmosphere(scene, renderer, { hour = 17.8 } = {}) {
   scene.add(sun)
   scene.add(sun.target)
 
-  scene.fog = new THREE.FogExp2(0xa9cbe0, 0.0013)
+  scene.fog = new THREE.FogExp2(0xa9cbe0, 0.0012 * HAZE)
 
   const sunDir = new THREE.Vector3()
   const sunOffset = new THREE.Vector3()
@@ -339,7 +344,8 @@ export function createAtmosphere(scene, renderer, { hour = 17.8 } = {}) {
     cloudColor.copy(s.haze).lerp(s.light, 0.55)
 
     scene.fog.color.copy(s.fog)
-    scene.fog.density = s.fogD
+    scene.fog.density = s.fogD * HAZE
+
     renderer.toneMappingExposure = s.exposure
     scene.environmentIntensity = s.envI
 
