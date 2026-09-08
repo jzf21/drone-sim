@@ -25,11 +25,55 @@ canvas { display: block; width: 100%; height: 100%; }
   backdrop-filter: blur(6px);
 }
 
-.top-left { top: 16px; left: 16px; max-width: 320px; }
+/* Left column: the panels stack, so none can ever overlap another as its
+   content grows. */
+.left-stack {
+  top: 16px; left: 16px; width: 320px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.left-stack > .panel { position: static; }
+
+.top-left { max-width: 320px; }
 .top-left h1 { font-size: 13px; letter-spacing: 1px; color: #35e0ff; margin-bottom: 8px; }
 .controls { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: #9fb4c0; }
 .controls b { color: #e8f4fa; }
 .hint { margin-top: 8px; font-size: 10px; color: #6d8494; line-height: 1.5; }
+
+.mission { width: 320px; }
+.mission h2 { font-size: 11px; letter-spacing: 1px; color: #35e0ff; margin-bottom: 8px; }
+.mission-line { font-size: 11px; line-height: 1.5; color: #c3d2db; margin-bottom: 4px; }
+.mission-line.hot { color: #ffb020; }
+.mission-line.done { color: #21d07a; }
+.mission-line.lost { color: #ff5252; }
+.mission .hint { margin-top: 6px; }
+.progress .bar.securing { background: #35e0ff; transition: none; }
+
+/* -- exposure / stealth panel ---------------------------------------------- */
+.exposure { width: 320px; border-color: rgba(53, 224, 255, 0.25); }
+.exposure h2 { font-size: 11px; letter-spacing: 1px; color: #35e0ff; margin-bottom: 8px; }
+.threat-state {
+  font-size: 13px; font-weight: bold; letter-spacing: 2px;
+  color: #21d07a;
+}
+.exposure .progress { margin-bottom: 6px; }
+.exposure .bar.exposure-bar { background: #21d07a; transition: width 0.12s linear; }
+.exposure .hint { margin-top: 6px; }
+
+.exposure.suspected { border-color: rgba(255, 176, 32, 0.45); }
+.exposure.suspected .threat-state { color: #ffb020; }
+.exposure.suspected .bar.exposure-bar { background: #ffb020; }
+
+.exposure.tracked { border-color: rgba(255, 122, 26, 0.6); }
+.exposure.tracked .threat-state { color: #ff7a1a; }
+.exposure.tracked .bar.exposure-bar { background: #ff7a1a; }
+
+.exposure.engaged { border-color: rgba(255, 82, 82, 0.7); }
+.exposure.engaged .threat-state { color: #ff5252; animation: pulse 0.6s ease-in-out infinite; }
+.exposure.engaged .bar.exposure-bar { background: #ff5252; }
+
+.cover-tag {
+  margin-top: 4px; font-size: 10px; letter-spacing: 1px; color: #35e0ff;
+}
 
 .top-right { top: 16px; right: 16px; width: 190px; }
 .telem-row { display: flex; justify-content: space-between; font-size: 12px; padding: 2px 0; }
@@ -150,7 +194,44 @@ canvas { display: block; width: 100%; height: 100%; }
 .down-sub { margin-top: 10px; font-size: 13px; color: #ffc2bc; letter-spacing: 1px; }
 .down-sub b { color: #fff; }
 
+.complete-overlay {
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: rgba(2, 20, 12, 0.45);
+  pointer-events: none;
+  animation: fade-out 1.2s ease-in 3.5s forwards;
+}
+.complete-title {
+  font-size: 44px;
+  font-weight: bold;
+  letter-spacing: 8px;
+  color: #21d07a;
+  text-shadow: 0 0 24px rgba(33, 208, 122, 0.7);
+}
+.complete-sub { margin-top: 10px; font-size: 13px; color: #bff0d6; letter-spacing: 1px; }
+@keyframes fade-out {
+  to { opacity: 0; }
+}
+
 .credit {
   bottom: 8px; right: 12px;
   font-size: 9px; color: #4a5d69;
+}
+
+/* Quiet counterpart to .zone-banner: you are inside their patrol envelope but
+   nothing has a lock on you yet. */
+.zone-notice {
+  top: 10%;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  letter-spacing: 2px;
+  color: #ffb020;
+  background: rgba(24, 16, 4, 0.55);
+  border: 1px solid rgba(255, 176, 32, 0.35);
+  border-radius: 6px;
+  padding: 5px 14px;
 }

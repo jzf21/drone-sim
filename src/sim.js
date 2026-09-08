@@ -15,6 +15,21 @@ const POND = { x: 260, z: 230, r: 55 }
 const MTN = { x: -140, z: 330, h: 150, sigma: 60 }
 const POOL = { x: -140, z: 205, r: 14 }
 const ZONE = { x: 520, z: 330, r: 200 }   // hostile airspace
+const ZONE_SAFE = ZONE.r + 60   // rivals give up the chase outside this radius
+const PICKUP_R = 7        // horizontal hover radius over the pad (m)
+const PICKUP_CEIL = 9     // max height above the pad to get a grapple (m)
+const SECURE_TIME = 1.6   // hover-and-hold to winch the payload aboard (s)
+
+// -- rival sensor model -----------------------------------------------------
+const SENSE_RANGE = 155   // how far their optics reach (m)
+const FOV_COS = Math.cos((58 * Math.PI) / 180)   // sensor cone half-angle
+const AWARE_HUNT = 0.35   // above this they come looking, but hold fire
+const AWARE_FIRE = 1      // full lock: weapons free
+const SEARCH_TIME = 14    // seconds spent sweeping a last-known position (s)
+const SQUAD_MEMORY = 22   // how long a radioed contact stays actionable (s)
+const RADAR_RANGE = 200   // base radar reach; sees through foliage, not walls (m)
+const RADAR_SPEED = 0.8   // sweep rate (rad/s)
+const RADAR_HALF = (13 * Math.PI) / 180   // sweep beam half-width
 
 // river centerline: plunge pool at the mountain's foot → winds east → pond
 const RIVER_SAMPLES = new THREE.CatmullRomCurve3([
@@ -102,8 +117,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
   renderer.shadowMap.type = THREE.PCFSoftShadowMap
 
   const scene = new THREE.Scene()
-  scene.background = new THREE.Color(0x8fc1e3)
-  scene.fog = new THREE.Fog(0x8fc1e3, 250, 1400)
+  scene.fog = new THREE.Fog(0xa9cbe0, 260, 1500)
 
   const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 3000)
   camera.position.set(X0 - 20, 30, 60)
@@ -115,9 +129,82 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
   sun.castShadow = true
   sun.shadow.mapSize.set(2048, 2048)
   const sc = sun.shadow.camera
-  sc.left = -500; sc.right = 500; sc.top = 120; sc.bottom = -120
-  sc.near = 50; sc.far = 700
+  // tight frustum that rides with the drone, so everything casts shadows
+  sc.left = -230; sc.right = 230; sc.top = 230; sc.bottom = -230
+  sc.near = 40; sc.far = 820
+  sun.shadow.bias = -0.0005
+  sun.shadow.normalBias = 0.5
   scene.add(sun)
+  scene.add(sun.target)
+  const SUN_OFFSET = new THREE.Vector3(180, 260, 120)
+  const SUN_DIR = SUN_OFFSET.clone().normalize()
+
+  const glowTex = makeGlowTexture()
+
+  // -- sky dome + drifting clouds -------------------------------------------
+  const sky = new THREE.Mesh(
+    new THREE.SphereGeometry(2500, 32, 16),
+    new THREE.ShaderMaterial({
+      side: THREE.BackSide, depthWrite: false, fog: false,
+      uniforms: {
+        zenith: { value: new THREE.Color(0x2458a0) },
+        horizon: { value: new THREE.Color(0xa9cbe0) },
+        haze: { value: new THREE.Color(0xcbd8dd) },
+        sunDir: { value: SUN_DIR },
+      },
+      vertexShader: `
+        varying vec3 vDir;
+        void main() {
+          vDir = position;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }`,
+      fragmentShader: `
+        uniform vec3 zenith;
+        uniform vec3 horizon;
+        uniform vec3 haze;
+        uniform vec3 sunDir;
+        varying vec3 vDir;
+        void main() {
+          vec3 d = normalize(vDir);
+          vec3 c = mix(horizon, zenith, smoothstep(0.0, 0.55, d.y));
+          c = mix(haze, c, smoothstep(-0.18, 0.04, d.y));
+          float s = max(dot(d, sunDir), 0.0);
+          c += vec3(1.0, 0.94, 0.78) * pow(s, 900.0) * 1.5;   // sun disc
+          c += vec3(1.0, 0.88, 0.66) * pow(s, 14.0) * 0.20;   // halo
+          gl_FragColor = vec4(c, 1.0);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }`,
+    })
+  )
+  sky.renderOrder = -1
+  sky.frustumCulled = false
+  scene.add(sky)
+
+  const CLOUD_SPREAD = 2400
+  const clouds = new THREE.Group()
+  {
+    const cloudTex = makeCloudTexture()
+    const crand = mulberry32(9001)   // separate stream: keeps fault RNG stable
+    for (let i = 0; i < 44; i++) {
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: cloudTex, transparent: true, depthWrite: false, fog: false,
+        opacity: 0.6 + crand() * 0.35,
+        color: new THREE.Color().setHSL(0.58, 0.1, 0.96 + crand() * 0.03),
+      }))
+      const w = 240 + crand() * 400
+      sp.scale.set(w, w * (0.34 + crand() * 0.16), 1)
+      // half the deck sits low enough to enter the chase camera's frame
+      sp.position.set(
+        (crand() - 0.5) * CLOUD_SPREAD,
+        (i % 2 ? 225 : 340) + crand() * 140,
+        (crand() - 0.5) * CLOUD_SPREAD
+      )
+      sp.userData.drift = 1.5 + crand() * 3.5
+      clouds.add(sp)
+    }
+    scene.add(clouds)
+  }
 
   // -- terrain --------------------------------------------------------------
   const groundTex = makeGroundTexture()
@@ -131,10 +218,48 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
       pos.setY(i, terrainHeight(pos.getX(i), pos.getZ(i)))
     }
     groundGeo.computeVertexNormals()
+
+    // paint the ground by height, slope and distance to water: grass on the
+    // flats, dirt then bare rock as it steepens, snow on the summit and sand
+    // along the pond / river banks. The map is neutral grey so hue comes from
+    // these vertex colours.
+    const nrm = groundGeo.attributes.normal
+    const col = new Float32Array(pos.count * 3)
+    const c = new THREE.Color()
+    const GRASS = new THREE.Color(0x74994f)
+    const DRY = new THREE.Color(0x9aa45e)
+    const DIRT = new THREE.Color(0x907a5a)
+    const ROCK = new THREE.Color(0x918c84)
+    const SNOW = new THREE.Color(0xf4f8fa)
+    const SAND = new THREE.Color(0xc9b98d)
+    const sstep = THREE.MathUtils.smoothstep
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i)
+      const slope = 1 - nrm.getY(i)          // 0 = flat, 1 = vertical
+      c.copy(GRASS).lerp(DRY, sstep(y, 10, 50))
+      c.lerp(DIRT, sstep(slope, 0.12, 0.45))
+      c.lerp(ROCK, sstep(slope, 0.42, 0.85))
+      c.lerp(ROCK, sstep(y, 72, 108))
+      c.lerp(SNOW, sstep(y, 112, 140))
+      const pd = Math.hypot(x - POND.x, z - POND.z)
+      const qd = Math.hypot(x - POOL.x, z - POOL.z)
+      const rd = riverNearest(x, z).d
+      const wet = Math.max(
+        1 - sstep(pd, POND.r * 0.55, POND.r + 12),
+        1 - sstep(qd, 12, 26),
+        1 - sstep(rd, 7, 16)
+      )
+      c.lerp(SAND, wet * 0.9)
+      const n = 0.92 + 0.16 * (Math.sin(x * 0.13) * Math.cos(z * 0.11) * 0.5 + 0.5)
+      col[i * 3] = c.r * n
+      col[i * 3 + 1] = c.g * n
+      col[i * 3 + 2] = c.b * n
+    }
+    groundGeo.setAttribute('color', new THREE.BufferAttribute(col, 3))
   }
   const ground = new THREE.Mesh(
     groundGeo,
-    new THREE.MeshStandardMaterial({ map: groundTex, roughness: 1 })
+    new THREE.MeshStandardMaterial({ map: groundTex, roughness: 1, vertexColors: true })
   )
   ground.receiveShadow = true
   scene.add(ground)
@@ -321,7 +446,58 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     }
   }
 
-  const treeColliders = scatterVegetation(scene, rand)
+  // Structures go down before vegetation so trees never sprout inside a hangar.
+  // This shifts the RNG sequence, so the tree layout differs from before — still
+  // fully deterministic, just a different (and now building-aware) scatter.
+  const { colliders: structures, footprints: structureFootprints } =
+    buildStructures(scene, rand, ZONE)
+  const treeColliders = scatterVegetation(scene, rand, structureFootprints)
+
+  // -- sightlines ------------------------------------------------------------
+  // Foliage occludes optics but not radar, so trees are kept as a separate set:
+  // that is what makes the compound's buildings matter more than the treeline.
+  const treeShapes = treeColliders.map((tc) => ({
+    kind: 'cyl', x: tc.x, z: tc.z, r: tc.r, bound: tc.r,
+    y0: terrainHeight(tc.x, tc.z), y1: tc.top,
+  }))
+
+  // Broad-phase on a 2D bbox plus a height reject — most shapes are below a
+  // segment between two airborne drones and fall out on the first comparison.
+  function occludedBy(shapes, ax, ay, az, bx, by, bz) {
+    const minY = Math.min(ay, by)
+    const loX = Math.min(ax, bx)
+    const hiX = Math.max(ax, bx)
+    const loZ = Math.min(az, bz)
+    const hiZ = Math.max(az, bz)
+    for (const sh of shapes) {
+      if (minY > sh.y1) continue
+      const b = sh.bound
+      if (sh.x + b < loX || sh.x - b > hiX || sh.z + b < loZ || sh.z - b > hiZ) continue
+      if (segmentHitsShape(ax, ay, az, bx, by, bz, sh)) return true
+    }
+    return false
+  }
+
+  // Hills and the mountain break tracking exactly like a wall does.
+  function terrainBlocks(ax, ay, az, bx, by, bz) {
+    const dx = bx - ax
+    const dy = by - ay
+    const dz = bz - az
+    const steps = Math.min(40, Math.max(2, Math.ceil(Math.hypot(dx, dz) / 5)))
+    for (let i = 1; i < steps; i++) {
+      const f = i / steps
+      if (ay + dy * f < terrainHeight(ax + dx * f, az + dz * f)) return true
+    }
+    return false
+  }
+
+  function hasLineOfSight(from, to, throughFoliage = false) {
+    if (occludedBy(structures, from.x, from.y, from.z, to.x, to.y, to.z)) return false
+    if (!throughFoliage &&
+        occludedBy(treeShapes, from.x, from.y, from.z, to.x, to.y, to.z)) return false
+    return !terrainBlocks(from.x, from.y, from.z, to.x, to.y, to.z)
+  }
+
 
   // -- inspectable parts registry ------------------------------------------
   const parts = []
@@ -471,6 +647,92 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     }
   )
 
+  // nav lights: steady red (port) / green (starboard) + white strobe
+  const navLights = []
+  {
+    const mk = (hex, x, z, r) => {
+      const bulb = new THREE.Mesh(
+        new THREE.SphereGeometry(r, 8, 6),
+        new THREE.MeshBasicMaterial({ color: hex })
+      )
+      bulb.position.set(x, -0.15, z)
+      droneTilt.add(bulb)
+      const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: glowTex, color: hex, transparent: true, opacity: 0.55,
+        blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
+      }))
+      halo.scale.setScalar(r * 5)
+      bulb.add(halo)
+      navLights.push({ bulb, halo })
+      return { bulb, halo }
+    }
+    mk(0xff2a2a, 1.25, 0.5, 0.11)    // port  (local +x is the aircraft's left)
+    mk(0x22ee55, -1.25, 0.5, 0.11)   // starboard
+    mk(0xffffff, 0, -1.25, 0.13)     // tail strobe
+  }
+  const strobeBulb = navLights[2].bulb
+  const strobeHalo = navLights[2].halo
+
+  // -- particle pools: sparks, smoke ----------------------------------------
+  function makePool(n, texture, blending, useFog) {
+    const items = []
+    for (let i = 0; i < n; i++) {
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: texture, transparent: true, depthWrite: false,
+        blending, fog: useFog, opacity: 0,
+      }))
+      sp.visible = false
+      scene.add(sp)
+      items.push({ sp, life: 0, max: 1, vel: new THREE.Vector3(), s0: 1, s1: 1, o0: 1, grav: 0 })
+    }
+    let cur = 0
+    return {
+      spawn(pos, vel, o) {
+        const it = items[cur]
+        cur = (cur + 1) % n
+        it.sp.visible = true
+        it.sp.position.copy(pos)
+        it.vel.copy(vel)
+        it.life = it.max = o.life
+        it.s0 = o.s0; it.s1 = o.s1; it.o0 = o.o0; it.grav = o.grav || 0
+        it.sp.material.color.setHex(o.color)
+        it.sp.material.opacity = o.o0
+        it.sp.scale.set(o.s0, o.s0, 1)
+      },
+      update(dt) {
+        for (const it of items) {
+          if (it.life <= 0) continue
+          it.life -= dt
+          if (it.life <= 0) { it.sp.visible = false; continue }
+          it.vel.y -= it.grav * dt
+          it.sp.position.addScaledVector(it.vel, dt)
+          const f = 1 - it.life / it.max
+          const sz = THREE.MathUtils.lerp(it.s0, it.s1, f)
+          it.sp.scale.set(sz, sz, 1)
+          it.sp.material.opacity = it.o0 * (1 - f)
+        }
+      },
+    }
+  }
+
+  const sparks = makePool(140, glowTex, THREE.AdditiveBlending, false)
+  const smoke = makePool(80, makeMistTexture(), THREE.NormalBlending, true)
+  const sparkVel = new THREE.Vector3()
+
+  function sparkBurst(pos, count, color, speed) {
+    for (let i = 0; i < count; i++) {
+      sparkVel.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
+        .normalize().multiplyScalar(speed * (0.4 + Math.random()))
+      sparks.spawn(pos, sparkVel, {
+        life: 0.3 + Math.random() * 0.45, s0: 1.5, s1: 0.15,
+        o0: 1, color, grav: 14,
+      })
+    }
+  }
+
+  const ZERO = new THREE.Vector3()
+  let smokeAcc = 0
+
   // -- hostile territory ----------------------------------------------------
   const beaconMats = []
   {
@@ -534,27 +796,169 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     beaconMats.push(mastLampMat)
   }
 
-  // rival drones
+  // -- mission payload: recover the cargo pod from the enemy pad -------------
+  const PAD_Y = terrainHeight(ZONE.x, ZONE.z)
+  const CRATE_HOME = new THREE.Vector3(ZONE.x, PAD_Y + 2.4, ZONE.z)
+
+  const crate = new THREE.Group()
+  {
+    const shell = new THREE.Mesh(
+      new THREE.BoxGeometry(2.4, 1.8, 2.4),
+      new THREE.MeshStandardMaterial({ color: 0xb8912f, roughness: 0.55, metalness: 0.35 })
+    )
+    shell.castShadow = true
+    crate.add(shell)
+    const trimMat = new THREE.MeshBasicMaterial({ color: 0x35e0ff })
+    for (const [w, d] of [[2.5, 0.22], [0.22, 2.5]]) {
+      const band = new THREE.Mesh(new THREE.BoxGeometry(w, 0.22, d), trimMat)
+      crate.add(band)
+    }
+    const lid = new THREE.Mesh(
+      new THREE.BoxGeometry(1.5, 0.22, 1.5),
+      new THREE.MeshStandardMaterial({ color: 0x2b2f33, roughness: 0.7 })
+    )
+    lid.position.y = 0.95
+    crate.add(lid)
+  }
+  crate.position.copy(CRATE_HOME)
+  scene.add(crate)
+
+  const crateGlow = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: glowTex, color: 0x35e0ff, transparent: true, opacity: 0.55,
+    blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
+  }))
+  crateGlow.scale.setScalar(7)
+  crateGlow.position.copy(CRATE_HOME)
+  scene.add(crateGlow)
+
+  // light column so the pod is findable from outside the zone
+  const crateColumn = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.6, 1.6, 150, 12, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: 0x35e0ff, transparent: true, opacity: 0.12, side: THREE.DoubleSide,
+      depthWrite: false, blending: THREE.AdditiveBlending,
+    })
+  )
+  crateColumn.position.set(ZONE.x, PAD_Y + 75, ZONE.z)
+  scene.add(crateColumn)
+
+  // INBOUND -> SECURING -> CARRYING -> COMPLETE, or LOST if shot down laden
+  let mission = 'INBOUND'
+  let secure = 0
+
+  function stowCrate() {
+    crate.scale.setScalar(0.55)
+    crate.position.set(0, -1.15, 0)
+    crate.rotation.set(0, 0, 0)
+    droneTilt.add(crate)
+    crateGlow.visible = false
+    crateColumn.visible = false
+  }
+
+  function returnCrate() {
+    droneTilt.remove(crate)
+    scene.add(crate)
+    crate.scale.setScalar(1)
+    crate.position.copy(CRATE_HOME)
+    crateGlow.position.copy(CRATE_HOME)
+    crateGlow.visible = true
+    crateColumn.visible = true
+    secure = 0
+  }
+
+  // -- rival drones ---------------------------------------------------------
+  // Each one runs PATROL -> INVESTIGATE -> SEARCH -> PURSUE off its own
+  // awareness meter. Nothing here reads the player's position directly except
+  // through `senseUpdate`, so cover genuinely blinds them.
   const enemies = []
   for (let i = 0; i < 3; i++) {
     const { group, props } = buildFallbackDrone(0x33161a, 0xd92626)
     group.scale.setScalar(1.15)
     const obj = new THREE.Group()
     obj.add(group)
-    const home = new THREE.Vector3(
-      ZONE.x + [-25, 5, 25][i],
-      terrainHeight(ZONE.x, ZONE.z) + 12 + i * 4,
-      ZONE.z + [-12, 22, -22][i]
-    )
+    // overlapping circuits at different radii and altitudes, so the compound is
+    // covered from several angles and the gaps move
+    const route = []
+    for (let k = 0; k < 6; k++) {
+      const a = (k / 6) * Math.PI * 2 + i * 1.3
+      const rr = 52 + i * 34
+      const rx = ZONE.x + Math.cos(a) * rr
+      const rz = ZONE.z + Math.sin(a) * rr
+      route.push(new THREE.Vector3(
+        rx, terrainHeight(rx, rz) + 20 + i * 7 + Math.sin(a * 2) * 6, rz
+      ))
+    }
+    const home = route[0].clone()
     obj.position.copy(home)
     scene.add(obj)
-    enemies.push({ obj, props, home, vel: new THREE.Vector3(), cooldown: 1 + i * 0.5 })
+    enemies.push({
+      obj, props, home, route, leg: 0,
+      vel: new THREE.Vector3(),
+      cooldown: 1 + i * 0.5,
+      phase: i * 2.1,       // desynchronises their search orbits
+      state: 'PATROL',
+      aware: 0,               // 0 oblivious -> 1 weapons-free lock
+      facing: 0,              // sensor boresight, decoupled from velocity in PURSUE
+      lastKnown: new THREE.Vector3(),
+      hasContact: false,
+      searchT: 0,
+      losT: i * 0.04,         // staggered so the three LOS checks land on
+      los: false,             // different frames
+      visible: false,
+    })
+  }
+
+  // Shared contact report. One spotter vectors the others in — hiding from the
+  // drone that saw you is not the same as hiding from the squad.
+  const squad = { pos: new THREE.Vector3(), has: false, at: -99, level: 0 }
+  function squadReport(pos, t, level) {
+    squad.pos.copy(pos)
+    squad.has = true
+    squad.at = t
+    squad.level = Math.max(squad.level, level)
+  }
+
+  // Base radar: slow 360 sweep, long reach, sees through trees but not walls.
+  const radar = { angle: 0, mast: new THREE.Vector3(ZONE.x + 24, PAD_Y + 24, ZONE.z - 6) }
+  {
+    // Everything hangs off one pivot whose local +x is the beam axis, so
+    // pointing the sweep is a single yaw and the bearing maths stays honest.
+    const pivot = new THREE.Group()
+    pivot.position.copy(radar.mast)
+    scene.add(pivot)
+    const dish = new THREE.Mesh(
+      new THREE.BoxGeometry(7, 2.6, 0.5),
+      new THREE.MeshStandardMaterial({ color: 0x9aa0a6, roughness: 0.6, metalness: 0.4 })
+    )
+    dish.rotation.y = Math.PI / 2
+    dish.castShadow = true
+    pivot.add(dish)
+    const sweep = new THREE.Mesh(
+      new THREE.CircleGeometry(RADAR_RANGE, 10, -RADAR_HALF, RADAR_HALF * 2),
+      new THREE.MeshBasicMaterial({
+        color: 0xff5a3c, transparent: true, opacity: 0.06, side: THREE.DoubleSide,
+        depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
+      })
+    )
+    sweep.rotation.x = -Math.PI / 2   // lie flat; the wedge still straddles +x
+    pivot.add(sweep)
+    radar.pivot = pivot
   }
 
   const projectiles = []
-  const projGeom = new THREE.SphereGeometry(0.35, 8, 6)
-  const projMat = new THREE.MeshBasicMaterial({ color: 0xff5040 })
-  let alerted = false
+  const projGeom = new THREE.CylinderGeometry(0.11, 0.11, 3.2, 6)
+  projGeom.rotateX(Math.PI / 2)   // long axis along +Z so lookAt() aims it
+  const projMat = new THREE.MeshBasicMaterial({ color: 0xffb060 })
+  const projHaloMat = new THREE.SpriteMaterial({
+    map: glowTex, color: 0xff5a28, transparent: true, opacity: 0.9,
+    blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
+  })
+  // Threat picture, recomputed each frame and read by the HUD and the debug hooks.
+  let alertLevel = 0   // 0 oblivious -> 1 someone has a firing lock on you
+  let eyesOn = 0       // hostiles with an unobstructed view of you right now
+  let engaged = false  // at least one has a lock and is shooting
+  let inCover = false  // a hostile is in range but every line to you is blocked
+  let threat = 'HIDDEN'
   let integrity = 100
   let playerDown = false
   let lastDamage = -10
@@ -564,7 +968,14 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     integrity = Math.max(0, integrity - amount)
     lastDamage = t
     shake = Math.min(shake + 0.5, 1.2)
-    if (integrity <= 0) playerDown = true
+    sparkBurst(drone.position, 12, 0xffb060, 9)
+    if (integrity <= 0) {
+      playerDown = true
+      if (mission === 'CARRYING') {
+        mission = 'LOST'
+        returnCrate()
+      }
+    }
   }
 
   // scan range ring + beam
@@ -618,6 +1029,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
         hits++
         lastHit = t
         shake = Math.min(shake + 0.7, 1.2)
+        sparkBurst(drone.position, 10, 0xffd890, 7)
         damagePlayer(4, t)
       } else {
         shake = Math.min(shake + 0.2, 1.2)
@@ -631,11 +1043,27 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
       setYaw: (v) => { yaw = v },
       getPos: () => drone.position.toArray(),
       getHits: () => hits,
+      getMission: () => ({ mission, secure, integrity: Math.round(integrity), down: playerDown }),
+      getExposure: () => ({ threat, exposure: alertLevel, eyesOn, inCover, squad: squad.has }),
+      getEnemyStates: () => enemies.map((e) => ({
+        state: e.state, aware: +e.aware.toFixed(2), visible: e.visible,
+        pos: e.obj.position.toArray().map((v) => +v.toFixed(1)),
+      })),
+      losTo: (x, y, z) => hasLineOfSight(drone.position, new THREE.Vector3(x, y, z)),
+      structures: () => structures.length,
+      getStructures: () => structures.map((sh) => ({ ...sh })),
+      setKey: (code, v) => { keys[code] = v },
     }
   }
 
   // -- loop -----------------------------------------------------------------
   const up = new THREE.Vector3(0, 1, 0)
+  const TMP_EYE = new THREE.Vector3()
+  const TMP_TGT = new THREE.Vector3()
+  const TMP_DIR = new THREE.Vector3()
+  const TMP_PREV = new THREE.Vector3()
+  const TMP_SEP = new THREE.Vector3()
+  const TMP_N = new THREE.Vector3()
   const clock = new THREE.Clock()
   let telemAcc = 0
   let raf = 0
@@ -669,8 +1097,22 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
         vel.set(0, 0, 0)
         integrity = 100
         playerDown = false
-        alerted = false
         shake = 0
+        // wipe the threat picture too, or you redeploy into a squad that is
+        // still hunting the wreck of your last airframe
+        alertLevel = 0
+        squad.has = false
+        squad.level = 0
+        squad.at = -99
+        for (const e of enemies) {
+          e.state = 'PATROL'
+          e.aware = 0
+          e.hasContact = false
+          e.searchT = 0
+          e.los = false
+          e.visible = false
+        }
+        if (mission !== 'COMPLETE') { mission = 'INBOUND'; secure = 0 }
       }
     }
 
@@ -738,51 +1180,256 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
       }
     }
 
+    // structures: the hard cover. Resolved on the shallowest axis including Y,
+    // so a roof catches you instead of shoving you off sideways.
+    for (const sh of structures) {
+      if (p.y > sh.y1 + 8) continue
+      const b = sh.bound + 8
+      if (Math.abs(p.x - sh.x) > b || Math.abs(p.z - sh.z) > b) continue
+      const out = pushOutOfShape(p.x, p.y, p.z, sh, 1.4)
+      if (!out) {
+        obstacle = Math.min(obstacle, distanceToShape(p.x, p.y, p.z, sh))
+      } else if (out.y === 1) {
+        // touching down on a roof: settle, don't ricochet
+        p.y += out.depth
+        if (vel.y < 0) {
+          if (vel.y < -3 && t - lastHit > 0.6) {
+            hits++
+            lastHit = t
+            shake = Math.min(shake + 0.6, 1.2)
+            damagePlayer(3, t)
+          }
+          vel.y = -vel.y * 0.25
+        }
+      } else {
+        bounce(TMP_N.set(out.x, out.y, out.z), out.depth, t)
+      }
+    }
+
     updateWater(dt, t)
 
     // hostile territory ----------------------------------------------------
     const zdx = p.x - ZONE.x
     const zdz = p.z - ZONE.z
     const zoneDist = Math.sqrt(zdx * zdx + zdz * zdz)
-    if (zoneDist < ZONE.r) alerted = true
-    else if (zoneDist > ZONE.r + 120) alerted = false
+    // Crossing the perimeter no longer makes them omniscient — it only puts you
+    // inside their patrol envelope. Being seen is what starts a fight.
+    const inZone = zoneDist < ZONE.r
 
+    const blink = alertLevel > 0.5 ? 10 : alertLevel > 0.05 ? 6 : 3
     for (const lamp of beaconMats) {
-      lamp.color.setHex(Math.sin(t * (alerted ? 10 : 3)) > 0 ? 0xff2a2a : 0x551111)
+      lamp.color.setHex(Math.sin(t * blink) > 0 ? 0xff2a2a : 0x551111)
     }
 
-    const sep = new THREE.Vector3()
+    // mission ---------------------------------------------------------------
+    const padDist = Math.hypot(p.x - ZONE.x, p.z - ZONE.z)
+    if (mission === 'INBOUND' || mission === 'SECURING') {
+      crate.rotation.y += 0.5 * dt
+      crate.position.y = CRATE_HOME.y + Math.sin(t * 1.6) * 0.35
+      crateGlow.position.copy(crate.position)
+      const pulse = 0.5 + 0.5 * Math.sin(t * 3)
+      crateGlow.material.opacity = 0.4 + 0.3 * pulse
+      crateGlow.scale.setScalar(6 + 2 * pulse)
+      crateColumn.material.opacity = 0.09 + 0.07 * pulse
+
+      const overPad = !playerDown && padDist < PICKUP_R &&
+        p.y > PAD_Y && p.y - PAD_Y < PICKUP_CEIL
+      if (overPad) {
+        mission = 'SECURING'
+        secure = Math.min(1, secure + dt / SECURE_TIME)
+        // winch sparks while the grapple hauls the pod up
+        if (Math.random() < dt * 14) {
+          sparks.spawn(crate.position, new THREE.Vector3(
+            (Math.random() - 0.5) * 3, 4 + Math.random() * 3, (Math.random() - 0.5) * 3
+          ), { life: 0.4, s0: 1.2, s1: 0.1, o0: 0.9, color: 0x8fefff, grav: 2 })
+        }
+        if (secure >= 1) { mission = 'CARRYING'; stowCrate() }
+      } else if (secure > 0) {
+        secure = Math.max(0, secure - dt * 0.7)
+        if (secure === 0) mission = 'INBOUND'
+      }
+    } else if (mission === 'CARRYING' && zoneDist > ZONE_SAFE &&
+               alertLevel < 0.05 && !squad.has) {
+      // clear only once the squad has genuinely lost you — outside the rim AND
+      // nobody still holding a contact. Hiding, not just sprinting, ends it.
+      mission = 'COMPLETE'
+    }
+
+    // -- rival sensors and AI ----------------------------------------------
+    const playerEye = TMP_EYE.copy(drone.position)
+    const playerAgl = p.y - terrainHeight(p.x, p.z)
+    const playerSpd = vel.length()
+    // the pod is loud: the winch, then the beacon you are hauling around
+    const noise = mission === 'SECURING' ? 2 : mission === 'CARRYING' ? 2.6 : 1
+
+    // base radar: slow sweep, long reach, blind to walls but not to trees
+    radar.angle = (radar.angle + RADAR_SPEED * dt) % (Math.PI * 2)
+    radar.pivot.rotation.y = radar.angle - Math.PI / 2
+    if (!playerDown) {
+      const rdx = p.x - radar.mast.x
+      const rdz = p.z - radar.mast.z
+      if (Math.hypot(rdx, rdz) < RADAR_RANGE) {
+        const da = Math.atan2(rdx, rdz) - radar.angle
+        if (Math.abs(Math.atan2(Math.sin(da), Math.cos(da))) < RADAR_HALF &&
+            hasLineOfSight(radar.mast, playerEye, true)) {
+          squadReport(playerEye, t, 0.55)
+        }
+      }
+    }
+
     for (const e of enemies) {
-      const pursuing = alerted && !playerDown
-      const target = pursuing
-        ? drone.position.clone().add(new THREE.Vector3(0, 2, 0))
-        : e.home
-      const toTarget = target.clone().sub(e.obj.position)
-      const dist = toTarget.length()
+      // --- sense -----------------------------------------------------------
+      TMP_DIR.subVectors(playerEye, e.obj.position)
+      const dist = TMP_DIR.length()
+      let visible = false
+      let boresight = 0
+      if (!playerDown && dist > 0.01 && dist < SENSE_RANGE) {
+        TMP_DIR.divideScalar(dist)
+        const cosA = TMP_DIR.x * Math.sin(e.facing) + TMP_DIR.z * Math.cos(e.facing)
+        if (cosA > FOV_COS) {
+          boresight = (cosA - FOV_COS) / (1 - FOV_COS)
+          e.losT -= dt
+          if (e.losT <= 0) {
+            e.losT = 0.12                 // ~8 Hz, staggered across the squad
+            e.los = hasLineOfSight(e.obj.position, playerEye)
+          }
+          visible = e.los
+        } else {
+          e.los = false
+          e.losT = 0                      // re-test the moment you re-enter the cone
+        }
+      } else {
+        e.los = false
+        e.losT = 0
+      }
+      e.visible = visible
+
+      if (visible) {
+        const prox = 1 - dist / SENSE_RANGE
+        let rate = 0.3 + 1.6 * prox * prox + 0.45 * boresight
+        rate *= 1 + Math.min(playerSpd / 20.84, 1) * 0.9              // motion betrays you
+        rate *= 1 + THREE.MathUtils.clamp(playerAgl / 60, 0, 1) * 0.7 // so does altitude
+        e.aware = Math.min(1, e.aware + rate * noise * dt)
+        if (e.aware > AWARE_HUNT) {
+          e.lastKnown.copy(playerEye)
+          e.hasContact = true
+          if (e.aware > 0.6) squadReport(playerEye, t, 0.6)
+        }
+      } else {
+        const decay = e.state === 'PURSUE' ? 0.24 : e.state === 'SEARCH' ? 0.14 : 0.32
+        e.aware = Math.max(0, e.aware - decay * dt)
+      }
+
+      // A radioed contact sends wingmates to look, but never past "go and
+      // look" — only a drone's own eyes unlock its weapons.
+      if (squad.has && t - squad.at < SQUAD_MEMORY && !visible &&
+          e.state === 'PATROL' && e.aware < AWARE_HUNT) {
+        e.aware = AWARE_HUNT + 0.02
+        e.lastKnown.copy(squad.pos)
+        e.hasContact = true
+      }
+
+      // --- state -----------------------------------------------------------
+      // Note the ordering: losing the lock drops to INVESTIGATE, whose target is
+      // the last known position, NOT the player. That is what makes cover work —
+      // they commit to where you were and you have to relocate.
+      if (visible && e.aware >= AWARE_FIRE) {
+        e.state = 'PURSUE'
+        e.searchT = 0
+      } else if (e.state === 'PURSUE') {
+        e.state = 'INVESTIGATE'
+        e.searchT = 0
+      } else if (e.state === 'INVESTIGATE') {
+        if (e.obj.position.distanceTo(e.lastKnown) < 14) { e.state = 'SEARCH'; e.searchT = 0 }
+      } else if (e.state === 'SEARCH') {
+        e.searchT += dt
+        if (e.searchT > SEARCH_TIME) {
+          e.state = 'PATROL'
+          e.hasContact = false
+          e.aware = 0
+        }
+      } else if (e.aware >= AWARE_HUNT && e.hasContact) {
+        e.state = 'INVESTIGATE'
+      }
+
+      // --- move --------------------------------------------------------------
+      const pursuing = e.state === 'PURSUE'
+      const target = TMP_TGT
+      if (pursuing) {
+        target.copy(playerEye)
+        target.y += 2
+      } else if (e.state === 'SEARCH') {
+        // Orbit of the last contact, widening as the sweep drags on. This is
+        // what eventually walks them around the hangar you ducked behind — so
+        // breaking line of sight buys time, not permanent safety.
+        const a = t * 1.1 + e.phase
+        const rr = 12 + e.searchT * 3.2
+        target.set(e.lastKnown.x + Math.cos(a) * rr, 0, e.lastKnown.z + Math.sin(a) * rr)
+        target.y = Math.max(e.lastKnown.y, terrainHeight(target.x, target.z) + 14)
+      } else if (e.state === 'INVESTIGATE') {
+        target.copy(e.lastKnown)
+        target.y = Math.max(target.y, terrainHeight(target.x, target.z) + 12)
+      } else {
+        target.copy(e.route[e.leg])
+        if (e.obj.position.distanceTo(target) < 12) e.leg = (e.leg + 1) % e.route.length
+      }
+
+      TMP_DIR.subVectors(target, e.obj.position)
+      const tdist = TMP_DIR.length()
       // keep a firing standoff instead of ramming
-      if (pursuing && dist < 18) toTarget.multiplyScalar(-0.4)
-      if (toTarget.lengthSq() > 0.01) toTarget.normalize()
-      e.vel.addScaledVector(toTarget, 30 * dt)
+      if (pursuing && tdist < 18) TMP_DIR.multiplyScalar(-0.4)
+      if (TMP_DIR.lengthSq() > 0.01) TMP_DIR.normalize()
+      e.vel.addScaledVector(TMP_DIR, 30 * dt)
       // separation from wingmates
       for (const o of enemies) {
         if (o === e) continue
-        sep.subVectors(e.obj.position, o.obj.position)
-        const sd = sep.length()
-        if (sd < 8 && sd > 0.01) e.vel.addScaledVector(sep.normalize(), (8 - sd) * 2 * dt)
+        TMP_SEP.subVectors(e.obj.position, o.obj.position)
+        const sd = TMP_SEP.length()
+        if (sd < 8 && sd > 0.01) e.vel.addScaledVector(TMP_SEP.normalize(), (8 - sd) * 2 * dt)
       }
       e.vel.multiplyScalar(Math.exp(-2 * dt))
-      const maxV = pursuing ? 19.5 : 12 // stays outrunnable at the new 75 km/h top speed
+      // stays outrunnable at the player's 75 km/h top speed
+      const maxV = pursuing ? 19.5 : e.state === 'PATROL' ? 10 : 15
       if (e.vel.length() > maxV) e.vel.setLength(maxV)
       e.obj.position.addScaledVector(e.vel, dt)
+
       const floor = terrainHeight(e.obj.position.x, e.obj.position.z) + 6
       if (e.obj.position.y < floor) {
         e.obj.position.y = floor
         if (e.vel.y < 0) e.vel.y = 0
       }
-      if (e.vel.lengthSq() > 1) e.obj.rotation.y = Math.atan2(e.vel.x, e.vel.z)
+      // cover stops them too — no clipping through a hangar wall to reach you
+      const ep = e.obj.position
+      for (const sh of structures) {
+        if (ep.y > sh.y1 + 4) continue
+        const b = sh.bound + 4
+        if (Math.abs(ep.x - sh.x) > b || Math.abs(ep.z - sh.z) > b) continue
+        const out = pushOutOfShape(ep.x, ep.y, ep.z, sh, 3.5)
+        if (!out) continue
+        ep.x += out.x * out.depth
+        ep.y += out.y * out.depth
+        ep.z += out.z * out.depth
+        const vn = e.vel.x * out.x + e.vel.y * out.y + e.vel.z * out.z
+        if (vn < 0) {
+          e.vel.x -= vn * out.x
+          e.vel.y -= vn * out.y
+          e.vel.z -= vn * out.z
+        }
+      }
+
+      // Facing drives the sensor cone, so while pursuing they face the target
+      // explicitly: the standoff manoeuvre above points velocity away from you
+      // and a velocity-derived heading would shake the lock loose mid-fight.
+      // The turn rate is capped, so flanking a drone really does buy you a beat.
+      const wantFacing = pursuing
+        ? Math.atan2(playerEye.x - ep.x, playerEye.z - ep.z)
+        : e.vel.lengthSq() > 1 ? Math.atan2(e.vel.x, e.vel.z) : e.facing
+      const dA = Math.atan2(Math.sin(wantFacing - e.facing), Math.cos(wantFacing - e.facing))
+      e.facing += THREE.MathUtils.clamp(dA, -2.6 * dt, 2.6 * dt)
+      e.obj.rotation.y = e.facing
       for (const r of e.props) r.rotation.y += 50 * dt
 
-      // fire at the intruder
+      // fire only on a held lock, which needs current line of sight
       e.cooldown -= dt
       if (pursuing && dist < 90 && e.cooldown <= 0) {
         e.cooldown = 1.2 + Math.random() * 0.8
@@ -793,26 +1440,86 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
         const dir = lead.sub(e.obj.position).normalize()
         const m = new THREE.Mesh(projGeom, projMat)
         m.position.copy(e.obj.position)
+        m.lookAt(m.position.clone().add(dir))
+        const halo = new THREE.Sprite(projHaloMat)
+        halo.scale.setScalar(2.4)
+        m.add(halo)
         scene.add(m)
         projectiles.push({ mesh: m, vel: dir.multiplyScalar(70), life: 2.5 })
+        sparks.spawn(e.obj.position, ZERO, {
+          life: 0.1, s0: 3.4, s1: 0.6, o0: 1, color: 0xffd8a0,
+        })
       }
     }
 
+    // --- squad picture -------------------------------------------------------
+    if (squad.has) {
+      squad.level = Math.max(0, squad.level - 0.1 * dt)
+      if (t - squad.at > SQUAD_MEMORY) { squad.has = false; squad.level = 0 }
+    }
+    alertLevel = squad.has ? squad.level : 0
+    eyesOn = 0
+    engaged = false
+    let nearestThreat = Infinity
+    for (const e of enemies) {
+      if (e.aware > alertLevel) alertLevel = e.aware
+      if (e.visible) eyesOn++
+      if (e.state === 'PURSUE') engaged = true
+      nearestThreat = Math.min(nearestThreat, e.obj.position.distanceTo(drone.position))
+    }
+    threat = engaged ? 'ENGAGED'
+      : eyesOn > 0 ? 'TRACKED'
+      : alertLevel > 0.05 || squad.has ? 'SUSPECTED'
+      : 'HIDDEN'
+    // "in cover" means something specific: a hostile is close enough to see you
+    // and every line to you is blocked. Being merely far away is not cover.
+    inCover = eyesOn === 0 && nearestThreat < SENSE_RANGE
+
     for (let i = projectiles.length - 1; i >= 0; i--) {
       const pr = projectiles[i]
-      pr.mesh.position.addScaledVector(pr.vel, dt)
+      const q = pr.mesh.position
+      TMP_PREV.copy(q)
+      q.addScaledVector(pr.vel, dt)
       pr.life -= dt
-      const hitPlayer = pr.mesh.position.distanceTo(drone.position) < 2
+      // Swept, not point, tests: at 70 m/s a round covers over a metre per
+      // frame and would tunnel clean through a 1.2 m blast wall.
+      const hitPlayer = !playerDown && segPointDistance(
+        TMP_PREV.x, TMP_PREV.y, TMP_PREV.z, q.x, q.y, q.z,
+        drone.position.x, drone.position.y, drone.position.z
+      ) < 2
       if (hitPlayer) damagePlayer(8, t)
-      if (hitPlayer || pr.life <= 0 ||
-          pr.mesh.position.y < terrainHeight(pr.mesh.position.x, pr.mesh.position.z)) {
+      const hitCover = !hitPlayer &&
+        occludedBy(structures, TMP_PREV.x, TMP_PREV.y, TMP_PREV.z, q.x, q.y, q.z)
+      const hitGround = q.y < terrainHeight(q.x, q.z)
+      if (hitCover || hitGround) sparkBurst(q, 8, 0xffc070, 6)
+      if (hitPlayer || hitCover || hitGround || pr.life <= 0) {
+        pr.mesh.clear()
         scene.remove(pr.mesh)
         projectiles.splice(i, 1)
       }
     }
 
+    // damage smoke: wisps below half integrity, a black plume once down
+    if (playerDown || integrity < 55) {
+      smokeAcc += dt * (playerDown ? 26 : (55 - integrity) * 0.28)
+      while (smokeAcc >= 1) {
+        smokeAcc -= 1
+        smoke.spawn(
+          drone.position,
+          new THREE.Vector3((Math.random() - 0.5) * 2, 1.6 + Math.random(), (Math.random() - 0.5) * 2),
+          {
+            life: 1.5 + Math.random(), s0: 1.4, s1: 7,
+            o0: playerDown ? 0.55 : 0.35,
+            color: playerDown ? 0x1e1e1e : 0x5a5a5a,
+          }
+        )
+      }
+    }
+    sparks.update(dt)
+    smoke.update(dt)
+
     // slow field repair once clear of hostile airspace
-    if (!alerted && !playerDown && integrity < 100) {
+    if (alertLevel < 0.05 && !playerDown && integrity < 100) {
       integrity = Math.min(100, integrity + 2 * dt)
     }
 
@@ -823,6 +1530,21 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
     droneTilt.rotation.z = THREE.MathUtils.damp(droneTilt.rotation.z, THREE.MathUtils.clamp(-sSpd * 0.022, -0.4, 0.4), 6, dt)
     droneTilt.position.y = Math.sin(t * 2.1) * 0.06
     for (const r of rotors) r.rotation.y += 45 * dt
+
+    // nav lights: steady sidelights, double-pulse white tail strobe
+    const ph = t % 1.7
+    const strobeOn = ph < 0.06 || (ph > 0.17 && ph < 0.23)
+    strobeBulb.visible = strobeOn
+    strobeHalo.material.opacity = strobeOn ? 1 : 0
+
+    // sun rides with the drone so the shadow frustum covers wherever we fly
+    sun.position.copy(p).add(SUN_OFFSET)
+    sun.target.position.set(p.x, terrainHeight(p.x, p.z), p.z)
+
+    for (const c of clouds.children) {
+      c.position.x += c.userData.drift * dt
+      if (c.position.x > CLOUD_SPREAD / 2) c.position.x -= CLOUD_SPREAD
+    }
 
     // camera chase + impact shake ------------------------------------------
     const camTarget = drone.position.clone().addScaledVector(forward, -13).add(new THREE.Vector3(0, 5.5, 0))
@@ -853,9 +1575,27 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
           id: part.id, type: part.label, status: part.status, note: part.note,
           towerRef: part.towerRef, x: part.pos.x, z: part.pos.z,
         })
+        if (part.status === 'FAULT') {
+          // corona glow marks the fault from well outside scan range
+          part.glow = new THREE.Sprite(new THREE.SpriteMaterial({
+            map: glowTex, color: 0xff4a24, transparent: true, opacity: 0.6,
+            blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
+          }))
+          part.glow.position.copy(part.pos)
+          scene.add(part.glow)
+        }
       }
       if (part.detected && part.status === 'FAULT') {
         for (const m of part.mats) m.emissiveIntensity = 0.6 + 0.5 * Math.sin(t * 6)
+        const pulse = 0.5 + 0.5 * Math.sin(t * 6)
+        part.glow.scale.setScalar(2.4 + 1.4 * pulse)
+        part.glow.material.opacity = 0.35 + 0.35 * pulse
+        // arcing: the odd spark drops off nearby faulted hardware
+        if (d < 140 && Math.random() < dt * 2.5) {
+          sparks.spawn(part.pos, new THREE.Vector3(
+            (Math.random() - 0.5) * 2, -1 - Math.random() * 2, (Math.random() - 0.5) * 2
+          ), { life: 0.55, s0: 1.1, s1: 0.1, o0: 0.95, color: 0xfff0b8, grav: 7 })
+        }
       }
     }
     if (nearest && nearestD < SCAN_RANGE * 1.6) {
@@ -883,11 +1623,25 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady }) {
         hits,
         recentHit: t - lastHit < 1,
         integrity: Math.round(integrity),
-        hostile: alerted,
+        hostile: engaged,
+        inZone,
+        threat,            // HIDDEN | SUSPECTED | TRACKED | ENGAGED
+        exposure: alertLevel,
+        eyesOn,
+        hostiles: enemies.length,
+        inCover,
+        mission,
+        secure,
+        // inbound: how far to the pod. laden: how much further to break contact.
+        missionDist: mission === 'CARRYING'
+          ? Math.max(0, ZONE_SAFE - zoneDist)
+          : padDist,
         down: playerDown,
         recentDamage: t - lastDamage < 0.5,
       })
     }
+
+    sky.position.copy(camera.position)
 
     renderer.render(scene, camera)
   }
@@ -1040,12 +1794,12 @@ function makeGroundTexture() {
   const c = document.createElement('canvas')
   c.width = c.height = 256
   const ctx = c.getContext('2d')
-  ctx.fillStyle = '#5a7a44'
+  ctx.fillStyle = '#ebebeb'
   ctx.fillRect(0, 0, 256, 256)
   const rnd = mulberry32(42)
   for (let i = 0; i < 900; i++) {
-    const g = 90 + rnd() * 60
-    ctx.fillStyle = `rgba(${g * 0.7}, ${g}, ${g * 0.5}, 0.35)`
+    const g = Math.round(180 + rnd() * 70)
+    ctx.fillStyle = `rgba(${g}, ${g}, ${g}, 0.5)`
     ctx.beginPath()
     ctx.arc(rnd() * 256, rnd() * 256, 1 + rnd() * 5, 0, Math.PI * 2)
     ctx.fill()
@@ -1103,7 +1857,45 @@ function makeMistTexture() {
   return new THREE.CanvasTexture(c)
 }
 
-function scatterVegetation(scene, rand) {
+function makeGlowTexture() {
+  const c = document.createElement('canvas')
+  c.width = c.height = 64
+  const ctx = c.getContext('2d')
+  const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32)
+  g.addColorStop(0, 'rgba(255,255,255,1)')
+  g.addColorStop(0.25, 'rgba(255,255,255,0.55)')
+  g.addColorStop(1, 'rgba(255,255,255,0)')
+  ctx.fillStyle = g
+  ctx.fillRect(0, 0, 64, 64)
+  const tex = new THREE.CanvasTexture(c)
+  tex.colorSpace = THREE.SRGBColorSpace
+  return tex
+}
+
+function makeCloudTexture() {
+  const c = document.createElement('canvas')
+  c.width = 256; c.height = 128
+  const ctx = c.getContext('2d')
+  const rnd = mulberry32(23)
+  for (let i = 0; i < 26; i++) {
+    const x = 32 + rnd() * 192
+    const y = 74 - Math.abs(x - 128) * 0.12 - rnd() * 34
+    const r = 16 + rnd() * 32
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r)
+    g.addColorStop(0, 'rgba(255,255,255,0.9)')
+    g.addColorStop(0.5, 'rgba(255,255,255,0.4)')
+    g.addColorStop(1, 'rgba(255,255,255,0)')
+    ctx.fillStyle = g
+    ctx.beginPath()
+    ctx.arc(x, y, r, 0, Math.PI * 2)
+    ctx.fill()
+  }
+  const tex = new THREE.CanvasTexture(c)
+  tex.colorSpace = THREE.SRGBColorSpace
+  return tex
+}
+
+function scatterVegetation(scene, rand, footprints = []) {
   const colliders = []
   const m = new THREE.Matrix4()
 
@@ -1114,6 +1906,12 @@ function scatterVegetation(scene, rand) {
     const mdx = x - MTN.x, mdz = z - MTN.z
     return mdx * mdx + mdz * mdz < 50 * 50 // rocky summit stays bare
   }
+
+  // buildings claim their plot; nothing grows through a roof
+  const onPlot = (x, z) =>
+    footprints.some((f) => (x - f.x) ** 2 + (z - f.z) ** 2 < f.r * f.r)
+
+  const blocked = (x, z) => nearWater(x, z) || onPlot(x, z)
 
   // trees (collidable)
   {
@@ -1129,7 +1927,7 @@ function scatterVegetation(scene, rand) {
       do {
         x = (rand() - 0.5) * (LINE_LEN + 500)
         z = (rand() - 0.5) * 700
-      } while (Math.abs(z) < 30 || nearWater(x, z))
+      } while (Math.abs(z) < 30 || blocked(x, z))
       const s = 0.7 + rand() * 1.2
       const y = terrainHeight(x, z)
       m.makeScale(s, s, s).setPosition(x, y + 2 * s, z)
@@ -1153,7 +1951,7 @@ function scatterVegetation(scene, rand) {
       do {
         x = (rand() - 0.5) * (LINE_LEN + 500)
         z = (rand() - 0.5) * 700
-      } while (nearWater(x, z))
+      } while (blocked(x, z))
       const s = 0.6 + rand() * 1.3
       m.makeScale(s * 1.4, s * 0.8, s * 1.4).setPosition(x, terrainHeight(x, z) + 0.5 * s, z)
       bushes.setMatrixAt(i, m)
@@ -1172,7 +1970,7 @@ function scatterVegetation(scene, rand) {
       do {
         x = (rand() - 0.5) * (LINE_LEN + 600)
         z = (rand() - 0.5) * 800
-      } while (nearWater(x, z))
+      } while (blocked(x, z))
       const s = 0.5 + rand() * 2.6
       m.makeRotationY(rand() * Math.PI).scale(new THREE.Vector3(s, s * 0.7, s))
         .setPosition(x, terrainHeight(x, z) + 0.3 * s, z)
@@ -1182,4 +1980,405 @@ function scatterVegetation(scene, rand) {
   }
 
   return colliders
+}
+
+// ---------------------------------------------------------------------------
+// collision / occlusion primitives
+//
+// Structures are stored as one of two analytic shapes, both cheap to test for
+// containment and for segment intersection (needed by sightlines and tracers):
+//   { kind: 'box', x, z, hw, hd, y0, y1, rot }   yaw-rotated box
+//   { kind: 'cyl', x, z, r, y0, y1 }             vertical cylinder
+// `pad` inflates the shape, so one shape serves both a 0-radius sightline and
+// a fat-radius drone hull.
+// ---------------------------------------------------------------------------
+
+// world (x, z) -> box-local, undoing the box's yaw
+function boxLocal(px, pz, box) {
+  const c = Math.cos(box.rot)
+  const s = Math.sin(box.rot)
+  const dx = px - box.x
+  const dz = pz - box.z
+  return [c * dx - s * dz, s * dx + c * dz]
+}
+
+// slab clip of segment a->b against the box
+export function segmentHitsBox(ax, ay, az, bx, by, bz, box, pad = 0) {
+  const [lax, laz] = boxLocal(ax, az, box)
+  const [lbx, lbz] = boxLocal(bx, bz, box)
+  const hw = box.hw + pad
+  const hd = box.hd + pad
+  let t0 = 0
+  let t1 = 1
+  const slabs = [
+    [lax, lbx - lax, -hw, hw],
+    [ay, by - ay, box.y0 - pad, box.y1 + pad],
+    [laz, lbz - laz, -hd, hd],
+  ]
+  for (const [p, d, lo, hi] of slabs) {
+    if (Math.abs(d) < 1e-9) {
+      if (p < lo || p > hi) return false
+      continue
+    }
+    let ta = (lo - p) / d
+    let tb = (hi - p) / d
+    if (ta > tb) { const s = ta; ta = tb; tb = s }
+    if (ta > t0) t0 = ta
+    if (tb < t1) t1 = tb
+    if (t0 > t1) return false
+  }
+  return true
+}
+
+// quadratic clip in xz, then a linear clip against the cylinder's height band
+export function segmentHitsCylinder(ax, ay, az, bx, by, bz, cyl, pad = 0) {
+  const r = cyl.r + pad
+  const dx = bx - ax
+  const dz = bz - az
+  const ex = ax - cyl.x
+  const ez = az - cyl.z
+  const A = dx * dx + dz * dz
+  const B = 2 * (ex * dx + ez * dz)
+  const C = ex * ex + ez * ez - r * r
+  let t0 = 0
+  let t1 = 1
+  if (A < 1e-9) {
+    if (C > 0) return false   // purely vertical segment, outside the radius
+  } else {
+    const disc = B * B - 4 * A * C
+    if (disc < 0) return false
+    const sq = Math.sqrt(disc)
+    const ta = (-B - sq) / (2 * A)
+    const tb = (-B + sq) / (2 * A)
+    if (ta > t0) t0 = ta
+    if (tb < t1) t1 = tb
+    if (t0 > t1) return false
+  }
+  const dy = by - ay
+  const y0 = cyl.y0 - pad
+  const y1 = cyl.y1 + pad
+  if (Math.abs(dy) < 1e-9) return ay >= y0 && ay <= y1
+  let ya = (y0 - ay) / dy
+  let yb = (y1 - ay) / dy
+  if (ya > yb) { const s = ya; ya = yb; yb = s }
+  if (ya > t0) t0 = ya
+  if (yb < t1) t1 = yb
+  return t0 <= t1
+}
+
+// nearest-face escape from inside a shape: unit normal + penetration depth,
+// or null when the point is already outside. Y is a candidate axis too, so
+// roofs are landable rather than sucking you out sideways.
+export function pushOutOfBox(px, py, pz, box, pad = 0) {
+  const [lx, lz] = boxLocal(px, pz, box)
+  const hw = box.hw + pad
+  const hd = box.hd + pad
+  const penX = hw - Math.abs(lx)
+  const penZ = hd - Math.abs(lz)
+  const penUp = box.y1 + pad - py
+  const penDown = py - (box.y0 - pad)
+  if (penX <= 0 || penZ <= 0 || penUp <= 0 || penDown <= 0) return null
+  const penY = Math.min(penUp, penDown)
+  if (penY <= penX && penY <= penZ) {
+    return { x: 0, y: penUp < penDown ? 1 : -1, z: 0, depth: penY }
+  }
+  const c = Math.cos(box.rot)
+  const s = Math.sin(box.rot)
+  if (penX <= penZ) {
+    const sx = lx >= 0 ? 1 : -1
+    return { x: c * sx, y: 0, z: -s * sx, depth: penX }   // box-local +x in world
+  }
+  const sz = lz >= 0 ? 1 : -1
+  return { x: s * sz, y: 0, z: c * sz, depth: penZ }      // box-local +z in world
+}
+
+export function pushOutOfCylinder(px, py, pz, cyl, pad = 0) {
+  const r = cyl.r + pad
+  const dx = px - cyl.x
+  const dz = pz - cyl.z
+  const d = Math.sqrt(dx * dx + dz * dz)
+  const penR = r - d
+  const penUp = cyl.y1 + pad - py
+  const penDown = py - (cyl.y0 - pad)
+  if (penR <= 0 || penUp <= 0 || penDown <= 0) return null
+  const penY = Math.min(penUp, penDown)
+  if (penY <= penR) {
+    return { x: 0, y: penUp < penDown ? 1 : -1, z: 0, depth: penY }
+  }
+  if (d < 1e-6) return { x: 1, y: 0, z: 0, depth: penR }
+  return { x: dx / d, y: 0, z: dz / d, depth: penR }
+}
+
+export function segmentHitsShape(ax, ay, az, bx, by, bz, s, pad = 0) {
+  return s.kind === 'box'
+    ? segmentHitsBox(ax, ay, az, bx, by, bz, s, pad)
+    : segmentHitsCylinder(ax, ay, az, bx, by, bz, s, pad)
+}
+
+export function pushOutOfShape(px, py, pz, s, pad = 0) {
+  return s.kind === 'box'
+    ? pushOutOfBox(px, py, pz, s, pad)
+    : pushOutOfCylinder(px, py, pz, s, pad)
+}
+
+// ---------------------------------------------------------------------------
+// structures: hard cover that stops bullets, bodies and sightlines
+// ---------------------------------------------------------------------------
+
+// Shared materials so ~60 buildings cost a handful of draw-call state changes.
+function structureMats() {
+  return {
+    hull: new THREE.MeshStandardMaterial({ color: 0x7b7f83, roughness: 0.85, metalness: 0.15 }),
+    dark: new THREE.MeshStandardMaterial({ color: 0x3b4046, roughness: 0.9 }),
+    rust: new THREE.MeshStandardMaterial({ color: 0x8a5236, roughness: 0.95 }),
+    tank: new THREE.MeshStandardMaterial({ color: 0xa8ab9e, roughness: 0.6, metalness: 0.35 }),
+    conc: new THREE.MeshStandardMaterial({ color: 0x9a978e, roughness: 1 }),
+    barn: new THREE.MeshStandardMaterial({ color: 0x6e3b30, roughness: 0.95 }),
+    roof: new THREE.MeshStandardMaterial({ color: 0x4a4f55, roughness: 0.8, metalness: 0.2 }),
+  }
+}
+
+// Every helper below appends its collider(s) to `out` and its meshes to `scene`,
+// so the visual and the collision shape can never drift apart.
+function addBox(scene, out, mat, { x, z, w, d, h, base, rot = 0, solid = true }) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat)
+  m.position.set(x, base + h / 2, z)
+  m.rotation.y = rot
+  m.castShadow = true
+  m.receiveShadow = true
+  scene.add(m)
+  const box = {
+    kind: 'box', x, z, hw: w / 2, hd: d / 2, y0: base, y1: base + h, rot,
+    bound: Math.hypot(w / 2, d / 2),   // broad-phase radius
+  }
+  if (solid) out.push(box)
+  return box
+}
+
+function addCyl(scene, out, mat, { x, z, r, h, base, rt = r, solid = true }) {
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(rt, r, h, 12), mat)
+  m.position.set(x, base + h / 2, z)
+  m.castShadow = true
+  m.receiveShadow = true
+  scene.add(m)
+  const cyl = {
+    kind: 'cyl', x, z, r: Math.max(r, rt), y0: base, y1: base + h,
+    bound: Math.max(r, rt),
+  }
+  if (solid) out.push(cyl)
+  return cyl
+}
+
+// Pitched gable roof: two slabs leaning against a ridge. Purely decorative —
+// the box underneath is the collider, so the silhouette can be as fussy as it
+// likes without complicating collision or sightlines.
+function addRoof(scene, mat, { x, z, w, d, h, base, rot = 0 }) {
+  const g = new THREE.Group()
+  g.position.set(x, base, z)
+  g.rotation.y = rot
+  const dd = d * 1.08          // slight eave overhang
+  const slope = Math.atan2(h, dd / 2)
+  const len = Math.hypot(h, dd / 2)
+  for (const side of [-1, 1]) {
+    // ridge ends up at (0, h, 0), eaves at (0, 0, ±dd/2)
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w * 1.04, 0.35, len), mat)
+    m.rotation.x = side * slope
+    m.position.set(0, h / 2, (side * dd) / 4)
+    m.castShadow = true
+    g.add(m)
+  }
+  scene.add(g)
+}
+
+// A hangar: long shed, pitched roof, roller door. The workhorse of the compound.
+function addHangar(scene, out, mats, { x, z, w, d, h, base, rot }) {
+  addBox(scene, out, mats.hull, { x, z, w, d, h, base, rot })
+  addRoof(scene, mats.roof, { x, z, w, d, h: 3.4, base: base + h, rot })
+  // door panel on the +local-z face, purely visual
+  const c = Math.cos(rot)
+  const s = Math.sin(rot)
+  const door = new THREE.Mesh(new THREE.BoxGeometry(w * 0.45, h * 0.7, 0.3), mats.dark)
+  door.position.set(x + s * (d / 2 + 0.2), base + h * 0.35, z + c * (d / 2 + 0.2))
+  door.rotation.y = rot
+  scene.add(door)
+}
+
+// Stack of shipping containers — irregular cover you can weave through.
+function addContainers(scene, out, mats, rand, { x, z, rot, n }) {
+  const palette = [0xb2603a, 0x3f6f7e, 0x8a8f52, 0x77414a]
+  for (let i = 0; i < n; i++) {
+    const tier = i < n - 1 ? 0 : 1
+    const ox = (i % 3) * 6.6 - 6.6
+    const oz = Math.floor(i / 3) * 3 - 1.5
+    const c = Math.cos(rot)
+    const s = Math.sin(rot)
+    const mat = new THREE.MeshStandardMaterial({
+      color: palette[Math.floor(rand() * palette.length)], roughness: 0.9,
+    })
+    addBox(scene, out, mat, {
+      x: x + c * ox + s * oz, z: z - s * ox + c * oz,
+      w: 6.2, d: 2.6, h: 2.7, base: tier * 2.75, rot,
+    })
+  }
+}
+
+// Blast walls ringing the pad, with deliberate gaps so the pad stays enterable
+// from cover rather than sealed off.
+function addBlastRing(scene, out, mats, { x, z, r, terrainHeight }) {
+  const SEG = 14
+  for (let i = 0; i < SEG; i++) {
+    if (i % 4 === 1) continue   // the gaps: four approach lanes
+    const a = (i / SEG) * Math.PI * 2
+    const wx = x + Math.cos(a) * r
+    const wz = z + Math.sin(a) * r
+    addBox(scene, out, mats.conc, {
+      x: wx, z: wz, w: (2 * Math.PI * r) / SEG - 1.5, d: 1.2, h: 5.5,
+      base: terrainHeight(wx, wz), rot: -a + Math.PI / 2,
+    })
+  }
+}
+
+function buildStructures(scene, rand, ZONE_ARG) {
+  const out = []
+  const mats = structureMats()
+  const gh = terrainHeight
+
+  // -- enemy compound, inside the hostile zone ------------------------------
+  const { x: zx, z: zz } = ZONE_ARG
+  const padY = gh(zx, zz)
+
+  addBlastRing(scene, out, mats, { x: zx, z: zz, r: 34, terrainHeight: gh })
+
+  // two hangars flanking the pad — the primary hard cover over the objective
+  addHangar(scene, out, mats, {
+    x: zx - 52, z: zz + 16, w: 30, d: 14, h: 11, base: gh(zx - 52, zz + 16), rot: 0.35,
+  })
+  addHangar(scene, out, mats, {
+    x: zx + 44, z: zz + 40, w: 26, d: 13, h: 10, base: gh(zx + 44, zz + 40), rot: -1.15,
+  })
+
+  // fuel farm: four tanks, tall enough to hide a hovering drone behind
+  for (const [ox, oz, r, h] of [[-18, -52, 6, 15], [-4, -56, 6, 15], [10, -50, 5, 12], [23, -58, 5, 12]]) {
+    const sx = zx + ox
+    const sz = zz + oz
+    addCyl(scene, out, mats.tank, { x: sx, z: sz, r, h, base: gh(sx, sz) })
+    const cap = new THREE.Mesh(new THREE.SphereGeometry(r, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2), mats.tank)
+    cap.position.set(sx, gh(sx, sz) + h, sz)
+    cap.castShadow = true
+    scene.add(cap)
+  }
+
+  // container yard on the approach side
+  addContainers(scene, out, mats, rand, { x: zx + 62, z: zz - 26, rot: 0.5, n: 7 })
+  addContainers(scene, out, mats, rand, { x: zx - 34, z: zz - 40, rot: -0.8, n: 5 })
+
+  // control block beside the pad
+  addBox(scene, out, mats.dark, {
+    x: zx + 22, z: zz + 8, w: 12, d: 10, h: 8, base: gh(zx + 22, zz + 8), rot: 0.2,
+  })
+
+  // -- map-wide structures --------------------------------------------------
+  // Substation next to the corridor: transformer blocks + a control hut. Kept
+  // off the wires so it reads as cover from the line without fouling the scan run.
+  for (const side of [-1, 1]) {
+    const sx = X0 + SPAN * (side < 0 ? 2 : 4)
+    const sz = side * 58
+    addBox(scene, out, mats.conc, { x: sx - 9, z: sz, w: 7, d: 7, h: 6, base: gh(sx - 9, sz), rot: 0 })
+    addBox(scene, out, mats.conc, { x: sx + 1, z: sz + 2, w: 7, d: 7, h: 6, base: gh(sx + 1, sz + 2), rot: 0 })
+    addBox(scene, out, mats.hull, { x: sx + 13, z: sz - 4, w: 10, d: 8, h: 5, base: gh(sx + 13, sz - 4), rot: 0.3 })
+    addCyl(scene, out, mats.tank, { x: sx + 24, z: sz + 6, r: 3.4, h: 18, base: gh(sx + 24, sz + 6) })
+  }
+
+  // Scattered farmsteads, warehouses, silos and water towers across the map.
+  // Rejection-sampled away from the wires, the pond, the river and the compound.
+  const KINDS = ['barn', 'warehouse', 'silo', 'tower', 'shed']
+  let placed = 0
+  let guard = 0
+  const footprints = []
+  while (placed < 26 && guard++ < 4000) {
+    const x = (rand() - 0.5) * (LINE_LEN + 620)
+    const z = (rand() - 0.5) * 780
+    const az = Math.abs(z)
+    if (az < 34 || az > 340) continue                       // clear of the wires
+    const pdx = x - POND.x, pdz = z - POND.z
+    if (pdx * pdx + pdz * pdz < (POND.r + 30) * (POND.r + 30)) continue
+    if (riverNearest(x, z).d < 30) continue
+    const mdx = x - MTN.x, mdz = z - MTN.z
+    if (mdx * mdx + mdz * mdz < 110 * 110) continue         // off the mountain
+    const cdx = x - zx, cdz = z - zz
+    if (cdx * cdx + cdz * cdz < 120 * 120) continue         // compound owns its ground
+    if (footprints.some((f) => (f.x - x) ** 2 + (f.z - z) ** 2 < 52 * 52)) continue
+    // steep ground reads as a building sunk into a hillside — skip it
+    const y = gh(x, z)
+    if (Math.abs(gh(x + 6, z) - y) > 3 || Math.abs(gh(x, z + 6) - y) > 3) continue
+
+    const rot = rand() * Math.PI * 2
+    const kind = KINDS[Math.floor(rand() * KINDS.length)]
+    if (kind === 'barn') {
+      const w = 16 + rand() * 8
+      addBox(scene, out, mats.barn, { x, z, w, d: 10, h: 7, base: y, rot })
+      addRoof(scene, mats.rust, { x, z, w, d: 10, h: 3.6, base: y + 7, rot })
+    } else if (kind === 'warehouse') {
+      const w = 22 + rand() * 12
+      addBox(scene, out, mats.hull, { x, z, w, d: 13, h: 9, base: y, rot })
+      addRoof(scene, mats.roof, { x, z, w, d: 13, h: 2.8, base: y + 9, rot })
+    } else if (kind === 'silo') {
+      const n = 2 + Math.floor(rand() * 2)
+      for (let i = 0; i < n; i++) {
+        const ox = Math.cos(rot) * i * 9
+        const oz = -Math.sin(rot) * i * 9
+        addCyl(scene, out, mats.conc, {
+          x: x + ox, z: z + oz, r: 3.8, h: 16 + rand() * 8, base: gh(x + ox, z + oz),
+        })
+      }
+    } else if (kind === 'tower') {
+      // water tower: legs are decorative, the tank up top is the real occluder
+      const h = 16 + rand() * 6
+      for (const [lx, lz] of [[-3, -3], [3, -3], [-3, 3], [3, 3]]) {
+        const m = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.35, h, 5), mats.dark)
+        m.position.set(x + lx, y + h / 2, z + lz)
+        m.castShadow = true
+        scene.add(m)
+      }
+      addCyl(scene, out, mats.tank, { x, z, r: 6, h: 8, base: y + h })
+    } else {
+      addBox(scene, out, mats.rust, { x, z, w: 9 + rand() * 5, d: 8, h: 5, base: y, rot })
+    }
+    footprints.push({ x, z, r: 26 })
+    placed++
+  }
+
+  return { colliders: out, footprints, padY }
+}
+
+// shortest distance from a point to the shape's surface (0 when inside)
+export function distanceToShape(px, py, pz, s) {
+  let dx = 0
+  let dz = 0
+  if (s.kind === 'box') {
+    const [lx, lz] = boxLocal(px, pz, s)
+    dx = Math.max(Math.abs(lx) - s.hw, 0)
+    dz = Math.max(Math.abs(lz) - s.hd, 0)
+  } else {
+    dx = Math.max(Math.hypot(px - s.x, pz - s.z) - s.r, 0)
+  }
+  const dy = Math.max(s.y0 - py, py - s.y1, 0)
+  return Math.sqrt(dx * dx + dy * dy + dz * dz)
+}
+
+// closest approach of a point to a segment — the swept test for fast tracers
+export function segPointDistance(ax, ay, az, bx, by, bz, px, py, pz) {
+  const dx = bx - ax
+  const dy = by - ay
+  const dz = bz - az
+  const l2 = dx * dx + dy * dy + dz * dz
+  let f = 0
+  if (l2 > 1e-12) {
+    f = ((px - ax) * dx + (py - ay) * dy + (pz - az) * dz) / l2
+    f = f < 0 ? 0 : f > 1 ? 1 : f
+  }
+  const qx = ax + dx * f - px
+  const qy = ay + dy * f - py
+  const qz = az + dz * f - pz
+  return Math.sqrt(qx * qx + qy * qy + qz * qz)
 }

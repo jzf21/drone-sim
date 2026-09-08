@@ -3,6 +3,26 @@ import { createSim } from './sim.js'
 
 const LINE_LEN = 140 * 6
 
+// How the exposure meter reads, and what to do about it.
+const THREAT = {
+  HIDDEN: {
+    mark: '\u25cb', label: 'UNDETECTED',
+    hint: 'Nothing has eyes on you. Stay low and slow — speed and altitude both give you away.',
+  },
+  SUSPECTED: {
+    mark: '\u25d1', label: 'SEARCHING',
+    hint: 'They are sweeping your last known position. Relocate before the search widens onto you.',
+  },
+  TRACKED: {
+    mark: '\u25d5', label: 'IN SIGHT',
+    hint: 'Break line of sight before the lock completes — put a hangar, a silo or a hillside between you.',
+  },
+  ENGAGED: {
+    mark: '\u25c9', label: 'LOCKED ON',
+    hint: 'Weapons free. Get behind hard cover; walls stop their rounds.',
+  },
+}
+
 function headingLetter(deg) {
   const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
   return dirs[Math.round(deg / 45) % 8]
@@ -30,14 +50,72 @@ export default function App() {
     <div className="app">
       <canvas ref={canvasRef} />
 
-      <div className="hud panel top-left">
+      <div className="hud left-stack">
+      <div className="panel top-left">
         <h1>⚡ POWERLINE INSPECTION DRONE</h1>
         <div className="controls">
           <span><b>W A S D</b> move</span>
           <span><b>SPACE / SHIFT</b> up / down</span>
           <span><b>Q / E</b> or <b>← →</b> yaw</span>
         </div>
-        <div className="hint">Fly within the cyan scan ring of line hardware to log it. Red = needs service.</div>
+        <div className="hint">
+          Fly within the cyan scan ring of line hardware to log it. Red = needs service.
+          Buildings, silos and hillsides block rival sightlines and stop their fire — use them.
+        </div>
+      </div>
+
+      {telem && (
+        <div className="panel mission">
+          <h2>MISSION · CARGO RECOVERY</h2>
+          {telem.mission === 'COMPLETE' ? (
+            <div className="mission-line done">✔ Payload extracted — mission complete</div>
+          ) : telem.mission === 'CARRYING' ? (
+            <>
+              <div className="mission-line hot">◆ PAYLOAD ABOARD — outrun them and break contact</div>
+              <div className="telem-row small">
+                <span>TO SAFETY</span><b>{telem.missionDist.toFixed(0)} m</b>
+              </div>
+            </>
+          ) : telem.mission === 'LOST' ? (
+            <div className="mission-line lost">✖ Payload lost — it has reset to the enemy pad</div>
+          ) : (
+            <>
+              <div className="mission-line">◆ Recover the cargo pod from the enemy landing pad</div>
+              <div className="telem-row small">
+                <span>TO PAD</span><b>{telem.missionDist.toFixed(0)} m</b>
+              </div>
+              <div className="hint">Follow the cyan light column. Hover low over the pad and hold to winch it aboard.</div>
+            </>
+          )}
+          {telem.mission === 'SECURING' && (
+            <>
+              <div className="progress">
+                <div className="bar securing" style={{ width: `${telem.secure * 100}%` }} />
+              </div>
+              <div className="telem-row small">
+                <span>SECURING</span><b>{Math.round(telem.secure * 100)}%</b>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {telem && (
+        <div className={`panel exposure ${telem.threat.toLowerCase()}`}>
+          <h2>EXPOSURE</h2>
+          <div className="threat-state">
+            {THREAT[telem.threat].mark} {THREAT[telem.threat].label}
+          </div>
+          <div className="progress">
+            <div className="bar exposure-bar" style={{ width: `${telem.exposure * 100}%` }} />
+          </div>
+          <div className="telem-row small">
+            <span>EYES ON</span><b>{telem.eyesOn}/{telem.hostiles}</b>
+          </div>
+          {telem.inCover && <div className="cover-tag">\u25a3 IN COVER \u2014 sightlines blocked</div>}
+          <div className="hint">{THREAT[telem.threat].hint}</div>
+        </div>
+      )}
       </div>
 
       {telem && (
@@ -80,11 +158,24 @@ export default function App() {
       {telem && telem.down && (
         <div className="hud down-overlay">
           <div className="down-title">DRONE DOWN</div>
-          <div className="down-sub">airframe destroyed — press <b>R</b> to redeploy</div>
+          <div className="down-sub">
+            {telem.mission === 'LOST'
+              ? <>airframe destroyed, payload dropped — press <b>R</b> to redeploy</>
+              : <>airframe destroyed — press <b>R</b> to redeploy</>}
+          </div>
         </div>
       )}
-      {telem && telem.hostile && !telem.down && (
-        <div className="hud zone-banner">☠ HOSTILE AIRSPACE — RIVAL DRONES ENGAGING</div>
+      {telem && telem.mission === 'COMPLETE' && (
+        <div className="hud complete-overlay">
+          <div className="complete-title">MISSION COMPLETE</div>
+          <div className="complete-sub">cargo pod recovered — clear of hostile airspace</div>
+        </div>
+      )}
+      {telem && telem.threat === 'ENGAGED' && !telem.down && (
+        <div className="hud zone-banner">☠ LOCKED ON — RIVAL DRONES ENGAGING</div>
+      )}
+      {telem && telem.inZone && telem.threat !== 'ENGAGED' && !telem.down && (
+        <div className="hud zone-notice">⌖ INSIDE HOSTILE PERIMETER</div>
       )}
       {telem && telem.recentDamage && !telem.down && <div className="hud damage-vignette" />}
       {telem && telem.recentHit && (
