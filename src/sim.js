@@ -98,10 +98,16 @@ function mulberry32(seed) {
 
 // -- terrain ---------------------------------------------------------------
 
+// Rolling foreland: one broad swell carrying progressively smaller octaves.
+// Total relief is ~52 m, which is what puts hills between the flats and the
+// distant range instead of an empty plain. Every caller runs this through the
+// corridor smoothstep in terrainHeight, so the powerline lane stays flat and
+// the towers and catenaries are unaffected.
 function fbm(x, z) {
   let h = 0
-  h += Math.sin(x * 0.004 + 1.7) * Math.cos(z * 0.005 + 0.3) * 10
-  h += Math.sin(x * 0.011 + 4.2) * Math.cos(z * 0.009 + 2.1) * 5
+  h += Math.sin(x * 0.0021 + 0.6) * Math.cos(z * 0.0018 + 2.4) * 26
+  h += Math.sin(x * 0.004 + 1.7) * Math.cos(z * 0.005 + 0.3) * 16
+  h += Math.sin(x * 0.011 + 4.2) * Math.cos(z * 0.009 + 2.1) * 7
   h += Math.sin(x * 0.027 + 0.9) * Math.cos(z * 0.023 + 5.0) * 2.2
   h += Math.sin(x * 0.061) * Math.cos(z * 0.055 + 1.2) * 0.9
   return h
@@ -118,14 +124,16 @@ export function terrainHeight(x, z) {
   // pond basin
   const dx = x - POND.x
   const dz = z - POND.z
-  h -= 14 * Math.exp(-(dx * dx + dz * dz) / (2 * POND.r * POND.r)) * s
+  // Deeper than the terrain now rolls across the pond's width, or a hillside
+  // would push up through the flat water plane on the uphill side.
+  h -= 22 * Math.exp(-(dx * dx + dz * dz) / (2 * POND.r * POND.r)) * s
   // river channel
   const rn = riverNearest(x, z)
-  if (rn.d < 18) h -= 6 * (1 - (rn.d / 18) ** 2) * s
+  if (rn.d < 18) h -= 9 * (1 - (rn.d / 18) ** 2) * s
   // waterfall plunge pool
   const pdx = x - POOL.x
   const pdz = z - POOL.z
-  h -= 7 * Math.exp(-(pdx * pdx + pdz * pdz) / (2 * 18 * 18)) * s
+  h -= 11 * Math.exp(-(pdx * pdx + pdz * pdz) / (2 * 18 * 18)) * s
   // notch carved down the mountain face for the falls
   const fdx = Math.abs(x - MTN.x)
   if (fdx < 12 && z > 195 && z < 262) {
@@ -239,11 +247,11 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     for (let i = 0; i < pos.count; i++) {
       const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i)
       const slope = 1 - nrm.getY(i)          // 0 = flat, 1 = vertical
-      c.copy(GRASS).lerp(DRY, sstep(y, 10, 50))
+      c.copy(GRASS).lerp(DRY, sstep(y, 30, 95))
       c.lerp(DIRT, sstep(slope, 0.12, 0.45))
       c.lerp(ROCK, sstep(slope, 0.42, 0.85))
-      c.lerp(ROCK, sstep(y, 72, 108))
-      c.lerp(SNOW, sstep(y, 112, 140))
+      c.lerp(ROCK, sstep(y, 95, 128))
+      c.lerp(SNOW, sstep(y, 126, 152))
       const pd = Math.hypot(x - POND.x, z - POND.z)
       const qd = Math.hypot(x - POOL.x, z - POOL.z)
       const rd = riverNearest(x, z).d
@@ -443,20 +451,11 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   track.position.y = 0.05
   scene.add(track)
 
-  // distant mountain ring
-  {
-    const mat = new THREE.MeshStandardMaterial({ color: 0x62798b, roughness: 1, flatShading: true })
-    for (let i = 0; i < 26; i++) {
-      const a = (i / 26) * Math.PI * 2 + drand() * 0.2
-      const dist = 1000 + drand() * 500
-      const h = 110 + drand() * 150
-      const r = 130 + drand() * 150
-      const m = new THREE.Mesh(new THREE.ConeGeometry(r, h, 5 + Math.floor(drand() * 3)), mat)
-      m.position.set(Math.cos(a) * dist, h / 2 - 25, Math.sin(a) * dist)
-      m.rotation.y = drand() * Math.PI
-      scene.add(m)
-    }
-  }
+  // Distant range. Its own RNG stream, following the convention `crand` set for
+  // the cloud deck — but note this replaces 26 cones that used to draw from
+  // `drand`, so the structure and tree scatter downstream lands differently
+  // than it did. Still fully deterministic, just a different layout.
+  buildRidgeBands(scene, mulberry32(7331))
 
   // Structures go down before vegetation so trees never sprout inside a hangar.
   // This shifts the RNG sequence, so the tree layout differs from before — still
@@ -751,24 +750,6 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   const BEACON_GAIN = 3.0   // lit; the dark half of the blink drops back under 1
   const beaconMats = []
   {
-    const wall = new THREE.Mesh(
-      new THREE.CylinderGeometry(ZONE.r, ZONE.r, 130, 64, 1, true),
-      new THREE.MeshBasicMaterial({
-        color: 0xff2a2a, transparent: true, opacity: 0.07,
-        side: THREE.DoubleSide, depthWrite: false,
-      })
-    )
-    wall.position.set(ZONE.x, 55, ZONE.z)
-    scene.add(wall)
-
-    const rim = new THREE.Mesh(
-      new THREE.TorusGeometry(ZONE.r, 0.9, 6, 96),
-      new THREE.MeshBasicMaterial({ color: hdr(0xff2a2a, 1.8), transparent: true, opacity: 0.5 })
-    )
-    rim.rotation.x = Math.PI / 2
-    rim.position.set(ZONE.x, 118, ZONE.z)
-    scene.add(rim)
-
     // perimeter warning pylons with blinking beacons
     const poleMat = new THREE.MeshStandardMaterial({ color: 0x3a3f44, roughness: 0.8 })
     for (let i = 0; i < 12; i++) {
@@ -1032,19 +1013,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     }
   }
 
-  // scan range ring + beam
-  const ringMat = new THREE.LineBasicMaterial({ color: hdr(0x35e0ff, 2.5), transparent: true, opacity: 0.35 })
-  const ring = new THREE.LineLoop(
-    new THREE.BufferGeometry().setFromPoints(
-      Array.from({ length: 64 }, (_, i) => {
-        const a = (i / 64) * Math.PI * 2
-        return new THREE.Vector3(Math.cos(a) * SCAN_RANGE, 0, Math.sin(a) * SCAN_RANGE)
-      })
-    ),
-    ringMat
-  )
-  drone.add(ring)
-
+  // scan beam
   const beamGeom = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()])
   const beam = new THREE.Line(beamGeom, new THREE.LineBasicMaterial({ color: hdr(0x35e0ff, 2.5), transparent: true, opacity: 0.8 }))
   beam.visible = false
@@ -1979,7 +1948,6 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     }
 
     // scanning -------------------------------------------------------------
-    ringMat.opacity = 0.2 + 0.15 * Math.sin(t * 3)
     let nearest = null
     let nearestD = Infinity
     for (const part of parts) {
@@ -2521,6 +2489,150 @@ function makeCloudTexture() {
   const tex = new THREE.CanvasTexture(c)
   tex.colorSpace = THREE.SRGBColorSpace
   return tex
+}
+
+// Distant range: three concentric bands, each a ridge swept around an arc.
+//
+// The profile across a band is a grid rather than a single foot-crest-foot
+// triangle: N angles by M rows down the face, with every row's height pushed
+// around by a noise in (angle, distance-down-slope). That noise is what carves
+// the spurs and gullies, and it also drives the shading, the colour mottle and
+// where snow settles — so the whole band comes off one function.
+//
+// The crest rides a low-frequency massif envelope, so the range rises into
+// distinct summits with deep saddles between them and the bands' silhouettes
+// cross in front of each other, rather than reading as one continuous rim.
+//
+// The inner radius is set by the hostile zone, which reaches ~894 m from the
+// origin at its far corner; a band any closer would cut through it.
+const RIDGE_BANDS = [
+  { r: 980, w: 260, base: 120, amp: 62, relief: 26, ks: [3, 5, 8, 13], snow: 168, trees: true, mLo: 0.40, mHi: 1.00 },
+  { r: 1320, w: 320, base: 185, amp: 80, relief: 34, ks: [2, 4, 7, 11], snow: 235, trees: false, mLo: 0.45, mHi: 0.95 },
+  { r: 1700, w: 300, base: 285, amp: 70, relief: 40, ks: [2, 3, 6, 9], snow: 330, trees: false, mLo: 0.72, mHi: 0.45 },
+]
+
+const TAU = Math.PI * 2
+
+// Sum of sines on integer harmonics of the angle, so it closes seamlessly at
+// the seam. `f` drifts each harmonic's phase as you travel down the face, which
+// is what makes the spurs lean rather than run straight down the fall line.
+function ridgeWave(harmonics, t, f = 0) {
+  let v = 0
+  let n = 0
+  for (const h of harmonics) {
+    v += h.a * Math.sin(t * TAU * h.k + h.p + f * h.q)
+    n += h.a
+  }
+  return v / n
+}
+
+function ridgeHarmonics(ks, rand) {
+  // Amplitude falls away across the harmonics, so each is one broad shape with
+  // smaller ones riding on it rather than uniform jitter.
+  return ks.map((k, i) => ({ k, a: 1 / (i + 1), p: rand() * TAU, q: (rand() - 0.5) * 6 }))
+}
+
+function buildRidgeBands(scene, rand) {
+  const N = 384          // angles around the ring: ~16 m of arc at the near band
+  const M = 9            // rows down the face
+  const UC = 0.45        // where the crest sits across the profile
+  const FOOT = -90       // buried below the deepest the foreland rolls
+
+  const LOW = new THREE.Color(0x4a5238)
+  const HEATH = new THREE.Color(0x6b5a5e)
+  const ROCK = new THREE.Color(0x7b8496)
+  const SNOW = new THREE.Color(0xeef4f7)
+  const CONIFER = new THREE.Color(0x2f4232)
+  const sstep = THREE.MathUtils.smoothstep
+  const clamp = THREE.MathUtils.clamp
+  const c = new THREE.Color()
+
+  // Faces point both ways: the player is inside the ring, but the bands are
+  // wide enough to fly past.
+  const mat = new THREE.MeshStandardMaterial({
+    vertexColors: true, roughness: 1, side: THREE.DoubleSide,
+  })
+
+  for (const band of RIDGE_BANDS) {
+    const crestH = ridgeHarmonics(band.ks, rand)
+    const radH = ridgeHarmonics(band.ks.map((k) => k + 1), rand)
+    const massifH = ridgeHarmonics([1, 2, 3], rand)
+    const spurH = ridgeHarmonics([11, 19, 31, 47], rand)
+    const mottleH = ridgeHarmonics([23, 41, 67], rand)
+
+    const pos = new Float32Array(N * M * 3)
+    const col = new Float32Array(N * M * 3)
+    const idx = []
+
+    for (let i = 0; i < N; i++) {
+      const t = i / N
+      const a = t * TAU
+      const ca = Math.cos(a)
+      const sa = Math.sin(a)
+
+      const massif = (0.5 + 0.5 * ridgeWave(massifH, t)) ** 1.5
+      const crest = band.base * (band.mLo + band.mHi * massif) + band.amp * ridgeWave(crestH, t)
+      const rad = band.r * (1 + 0.16 * ridgeWave(radH, t))
+
+      for (let j = 0; j < M; j++) {
+        const u = j / (M - 1)
+        // f is how far up the face we are: 0 at either foot, 1 at the crest.
+        const f = u <= UC ? u / UC : 1 - (u - UC) / (1 - UC)
+        const r = u <= UC
+          ? rad - band.w * (1 - u / UC)
+          : rad + band.w * ((u - UC) / (1 - UC))
+
+        // Flanks flare out at the base and steepen toward the crest.
+        const profile = f ** 1.7
+        // Spurs and gullies, pinched to nothing at the crest line and at the
+        // feet so neither the silhouette nor the join to the ground gets ragged.
+        const detail = ridgeWave(spurH, t, f) * Math.sin(Math.PI * f) * band.relief
+        const y = FOOT + (crest - FOOT) * profile + detail
+
+        const o = (i * M + j) * 3
+        pos[o] = ca * r
+        pos[o + 1] = y
+        pos[o + 2] = sa * r
+
+        // Colour by real height rather than by crest height, so a gully and the
+        // spur beside it are not the same shade.
+        c.copy(LOW).lerp(HEATH, sstep(y, 55, 145))
+        c.lerp(ROCK, sstep(y, 135, 225))
+        // Snow settles in the high hollows first, so a negative detail (a
+        // gully) reaches the snow line sooner than the spur next to it.
+        const hollow = clamp(-ridgeWave(spurH, t, f), 0, 1)
+        c.lerp(SNOW, sstep(y + hollow * 25, band.snow, band.snow + 40))
+        if (band.trees) {
+          c.lerp(CONIFER, sstep(y, 5, 45) * (1 - sstep(y, 80, 120)) * 0.75)
+        }
+
+        // These bands sit far outside the shadow frustum, so the light and
+        // shade that makes a range read has to be painted on: gullies go down,
+        // spur backs come up, and a fine mottle breaks the height banding.
+        const shade = 0.76 + 0.32 * clamp(ridgeWave(spurH, t, f) * 0.5 + 0.5, 0, 1)
+        const mottle = 0.90 + 0.20 * (0.5 + 0.5 * ridgeWave(mottleH, t, f))
+        c.multiplyScalar(shade * mottle)
+
+        col[o] = c.r; col[o + 1] = c.g; col[o + 2] = c.b
+      }
+    }
+
+    for (let i = 0; i < N; i++) {
+      const A = i * M
+      const B = ((i + 1) % N) * M
+      for (let j = 0; j < M - 1; j++) {
+        idx.push(A + j, A + j + 1, B + j + 1)
+        idx.push(A + j, B + j + 1, B + j)
+      }
+    }
+
+    const g = new THREE.BufferGeometry()
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3))
+    g.setAttribute('color', new THREE.BufferAttribute(col, 3))
+    g.setIndex(idx)
+    g.computeVertexNormals()
+    scene.add(new THREE.Mesh(g, mat))
+  }
 }
 
 function scatterVegetation(scene, rand, footprints = []) {
