@@ -40,6 +40,19 @@ const DROP_R = 5          // horizontal radius over the safehouse pad (m)
 const DROP_CEIL = 7.5     // must be under the hangar roof to unload (m)
 const DELIVER_TIME = 1.6  // hover-and-hold to winch the pod down (s)
 
+// -- race arena -------------------------------------------------------------
+// A gate circuit in the hills south of the corridor. ENTER teleports you onto
+// the start pad (and back out again); the gates themselves are part of the
+// world and can be flown any time — the timer only runs inside a race.
+const RACE_C = { x: 240, z: -300 }   // arena centre
+const VENUE = { x: 348, z: -300, h: 4.2 }   // paddock/start straight, under gate 0
+const ARENA_ENTER_R = 150 // you must actually be at the venue to start a race
+const RACE_LAPS = 2       // hard limit per race
+const GATE_R = 7          // ring radius (m)
+const GATE_PASS = 9.5     // pass detection radius around the ring centre (m)
+const AI_GATE_PASS = 11   // AI aim for the centre; give them a little slack
+const COUNTDOWN = 3       // seconds on the start clock
+
 // -- rival sensor model -----------------------------------------------------
 const SENSE_RANGE = 155   // how far their optics reach (m)
 const FOV_COS = Math.cos((58 * Math.PI) / 180)   // sensor cone half-angle
@@ -126,6 +139,11 @@ export function terrainHeight(x, z) {
   if (fdx < 12 && z > 195 && z < 262) {
     h -= 7 * (1 - (fdx / 12) ** 2) * THREE.MathUtils.smoothstep(262 - z, 0, 14) * s
   }
+  // race venue apron: the start straight and paddock sit on graded level ground
+  const vdx = x - VENUE.x
+  const vdz = z - VENUE.z
+  const vd = Math.sqrt(vdx * vdx + vdz * vdz)
+  if (vd < 120) h = THREE.MathUtils.lerp(VENUE.h, h, THREE.MathUtils.smoothstep(vd, 65, 120))
   return h
 }
 
@@ -444,6 +462,8 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   // fully deterministic, just a different (and now building-aware) scatter.
   const { colliders: structures, footprints: structureFootprints, safehouse } =
     buildStructures(scene, drand, ZONE)
+  // the race arena claims its plot too — no forest growing through the circuit
+  structureFootprints.push({ x: RACE_C.x, z: RACE_C.z, r: 165 })
   const treeColliders = scatterVegetation(scene, drand, structureFootprints)
 
   // -- sightlines ------------------------------------------------------------
@@ -999,6 +1019,273 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   beam.visible = false
   scene.add(beam)
 
+  // -- race arena ------------------------------------------------------------
+  // Deliberately RNG-free: gate positions come from closed-form curves, so the
+  // arena can never shift the fault or scenery layouts.
+  const gates = []
+  {
+    const N = 9
+    for (let i = 0; i < N; i++) {
+      const a = (i / N) * Math.PI * 2
+      const gx = RACE_C.x + Math.cos(a) * (108 + Math.sin(a * 2) * 16)
+      const gz = RACE_C.z + Math.sin(a) * (70 + Math.cos(a * 3) * 10)
+      const gy = terrainHeight(gx, gz) + 11 + Math.sin(a * 2.3) * 4
+      gates.push({ x: gx, y: gy, z: gz })
+    }
+    // orient each ring across the local direction of travel
+    for (let i = 0; i < N; i++) {
+      const prev = gates[(i + N - 1) % N]
+      const next = gates[(i + 1) % N]
+      gates[i].heading = Math.atan2(next.x - prev.x, next.z - prev.z)
+    }
+
+    const pylonMat = new THREE.MeshStandardMaterial({ color: 0x3a3f44, roughness: 0.8 })
+    const ringGeo = new THREE.TorusGeometry(GATE_R, 0.45, 10, 40)
+    for (let i = 0; i < N; i++) {
+      const g = gates[i]
+      // per-gate material so the "next gate" highlight can tint just one ring
+      g.mat = new THREE.MeshBasicMaterial({ color: hdr(0xff8c2a, 1.2) })
+      const ring = new THREE.Mesh(ringGeo, g.mat)
+      ring.position.set(g.x, g.y, g.z)
+      ring.rotation.y = g.heading
+      scene.add(ring)
+      const groundY = terrainHeight(g.x, g.z)
+      const pylon = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.3, 0.5, g.y - GATE_R - groundY, 6), pylonMat
+      )
+      pylon.position.set(g.x, (groundY + g.y - GATE_R) / 2, g.z)
+      scene.add(pylon)
+    }
+
+  }
+
+  // the paddock, pits and grandstands — real racetrack furniture, loaded from
+  // the Kenney Racing Kit (CC0)
+  buildRaceVenue(scene, structures)
+
+  // beacon column marking the player's next gate while racing
+  const gateColumn = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.2, 1.2, 90, 12, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: hdr(0x35e0ff, 3.0), transparent: true, opacity: 0.14, side: THREE.DoubleSide,
+      depthWrite: false, blending: THREE.AdditiveBlending,
+    })
+  )
+  gateColumn.visible = false
+  scene.add(gateColumn)
+
+  const RACER_DEFS = [
+    { name: 'VIPER', color: 0xff3b30, speed: 19.8 },
+    { name: 'ONYX', color: 0x9b59ff, speed: 18.8 },
+    { name: 'FALCON', color: 0xffd23c, speed: 17.8 },
+  ]
+  const racers = RACER_DEFS.map((d, i) => {
+    const { group, props } = buildFallbackDrone(0x22262c, d.color)
+    group.scale.setScalar(1.1)
+    const obj = new THREE.Group()
+    obj.add(group)
+    // parked on the paddock apron beside the pits between races
+    obj.position.set(
+      VENUE.x - 10,
+      terrainHeight(VENUE.x - 10, VENUE.z + 26 + i * 7) + 1.2,
+      VENUE.z + 26 + i * 7
+    )
+    scene.add(obj)
+    return {
+      ...d, obj, props,
+      vel: new THREE.Vector3(),
+      nextGate: 1, lap: 0, gatesPassed: 0,
+      finished: false, finishT: 0, prog: 0,
+      phase: i * 2.3,
+    }
+  })
+
+  // IDLE -> COUNTDOWN -> RACING -> DONE (player crossed the finish)
+  const race = {
+    state: 'IDLE',
+    countEnd: 0, t0: 0, lapStart: 0,
+    lap: 0, laps: [], best: null, total: null,
+    nextGate: 1, gatesPassed: 0, nextDist: 0,
+    pos: 1, standings: [],
+    prevPos: new THREE.Vector3(), prevYaw: 0,
+    startPos: new THREE.Vector3(),
+  }
+
+  function enterRace() {
+    race.prevPos.copy(drone.position)
+    race.prevYaw = yaw
+    const g = gates[0]
+    const fx0 = Math.sin(g.heading), fz0 = Math.cos(g.heading)   // travel dir
+    const px0 = Math.cos(g.heading), pz0 = -Math.sin(g.heading)  // across it
+    race.startPos.set(g.x - fx0 * 12, g.y, g.z - fz0 * 12)
+    drone.position.copy(race.startPos)
+    vel.set(0, 0, 0)
+    yaw = g.heading
+    race.state = 'COUNTDOWN'
+    race.countEnd = clock.elapsedTime + COUNTDOWN
+    race.lap = 0
+    race.laps = []
+    race.best = null
+    race.total = null
+    race.nextGate = 1
+    race.gatesPassed = 0
+    racers.forEach((r, i) => {
+      const off = (i % 2 ? -1 : 1) * (4.5 + Math.floor(i / 2) * 4.5)
+      r.obj.position.set(
+        race.startPos.x + px0 * off,
+        race.startPos.y,
+        race.startPos.z + pz0 * off
+      )
+      r.obj.rotation.y = g.heading
+      r.vel.set(0, 0, 0)
+      r.nextGate = 1
+      r.lap = 0
+      r.gatesPassed = 0
+      r.finished = false
+      r.finishT = 0
+      r.prog = 0
+    })
+  }
+
+  function exitRace() {
+    race.state = 'IDLE'
+    gateColumn.visible = false
+    drone.position.copy(race.prevPos)
+    vel.set(0, 0, 0)
+    yaw = race.prevYaw
+    racers.forEach((r, i) => {
+      r.obj.position.set(
+        VENUE.x - 10,
+        terrainHeight(VENUE.x - 10, VENUE.z + 26 + i * 7) + 1.2,
+        VENUE.z + 26 + i * 7
+      )
+      r.vel.set(0, 0, 0)
+    })
+  }
+
+  function updateRace(dt, t) {
+    const p2 = drone.position
+
+    if (race.state === 'COUNTDOWN') {
+      vel.set(0, 0, 0)
+      drone.position.copy(race.startPos)
+      if (t >= race.countEnd) {
+        race.state = 'RACING'
+        race.t0 = t
+        race.lapStart = t
+      }
+    }
+
+    const running = race.state === 'RACING' || race.state === 'DONE'
+
+    // player checkpoints
+    if (race.state === 'RACING' && !playerDown) {
+      const g = gates[race.nextGate]
+      const d = Math.hypot(p2.x - g.x, p2.y - g.y, p2.z - g.z)
+      race.nextDist = d
+      if (d < GATE_PASS) {
+        if (race.nextGate === 0) {
+          const lapT = t - race.lapStart
+          race.laps.push(lapT)
+          race.best = race.best === null ? lapT : Math.min(race.best, lapT)
+          race.lapStart = t
+          race.lap++
+          if (race.lap >= RACE_LAPS) {
+            race.state = 'DONE'
+            race.total = t - race.t0
+          }
+        }
+        race.gatesPassed++
+        race.nextGate = (race.nextGate + 1) % gates.length
+      }
+    }
+
+    // AI racers
+    for (const r of racers) {
+      if (!running) { continue }
+      const target = TMP_TGT
+      let maxV
+      if (r.finished) {
+        // victory-lap orbit above the arena, out of the racing line
+        const a = t * 0.4 + r.phase
+        target.set(
+          RACE_C.x + Math.cos(a) * 45,
+          terrainHeight(RACE_C.x, RACE_C.z) + 34,
+          RACE_C.z + Math.sin(a) * 45
+        )
+        maxV = 9
+      } else {
+        const g = gates[r.nextGate]
+        // a little wander so each racer flies its own line through the ring
+        target.set(
+          g.x + Math.sin(t * 0.7 + r.phase) * 2.5,
+          g.y + Math.cos(t * 0.9 + r.phase) * 1.5,
+          g.z + Math.cos(t * 0.7 + r.phase) * 2.5
+        )
+        // pace breathes a few percent so the field trades places
+        maxV = r.speed * (0.95 + 0.07 * Math.sin(t * 0.31 + r.phase))
+      }
+      TMP_DIR.subVectors(target, r.obj.position)
+      if (TMP_DIR.lengthSq() > 0.01) TMP_DIR.normalize()
+      r.vel.addScaledVector(TMP_DIR, 36 * dt)
+      r.vel.multiplyScalar(Math.exp(-2 * dt))
+      if (r.vel.length() > maxV) r.vel.setLength(maxV)
+      r.obj.position.addScaledVector(r.vel, dt)
+      const floor = terrainHeight(r.obj.position.x, r.obj.position.z) + 2
+      if (r.obj.position.y < floor) {
+        r.obj.position.y = floor
+        if (r.vel.y < 0) r.vel.y = 0
+      }
+      if (r.vel.lengthSq() > 1) r.obj.rotation.y = Math.atan2(r.vel.x, r.vel.z)
+      for (const pr of r.props) pr.rotation.y += 50 * dt
+
+      if (!r.finished) {
+        const g = gates[r.nextGate]
+        const d = r.obj.position.distanceTo(target.set(g.x, g.y, g.z))
+        r.prog = r.gatesPassed * 1e4 - d
+        if (d < AI_GATE_PASS) {
+          if (r.nextGate === 0) {
+            r.lap++
+            if (r.lap >= RACE_LAPS) {
+              r.finished = true
+              r.finishT = t - race.t0
+            }
+          }
+          r.gatesPassed++
+          r.nextGate = (r.nextGate + 1) % gates.length
+        }
+      }
+    }
+
+    // standings: finished racers rank by time, the rest by course progress
+    if (running) {
+      const myProg = race.gatesPassed * 1e4 - race.nextDist
+      race.standings = [
+        { name: 'YOU', prog: myProg, done: race.state === 'DONE', time: race.total },
+        ...racers.map((r) => ({ name: r.name, prog: r.prog, done: r.finished, time: r.finishT })),
+      ].sort((a, b) => (b.done - a.done) || (a.done ? a.time - b.time : b.prog - a.prog))
+      race.pos = race.standings.findIndex((s) => s.name === 'YOU') + 1
+    }
+
+    // gate dressing: the player's next ring burns cyan, the finish line green
+    const racing = race.state === 'RACING'
+    for (let i = 0; i < gates.length; i++) {
+      const g = gates[i]
+      if (racing && i === race.nextGate) {
+        g.mat.color.setHex(0x35e0ff).multiplyScalar(2.4 + Math.sin(t * 6) * 0.8)
+      } else if (i === 0) {
+        g.mat.color.setHex(0x21d07a).multiplyScalar(1.6)
+      } else {
+        g.mat.color.setHex(0xff8c2a).multiplyScalar(racing ? 0.55 : 1.2)
+      }
+    }
+    gateColumn.visible = racing
+    if (racing) {
+      const g = gates[race.nextGate]
+      gateColumn.position.set(g.x, terrainHeight(g.x, g.z) + 45, g.z)
+    }
+  }
+
   // -- input ----------------------------------------------------------------
   const keys = {}
   const onKey = (e) => {
@@ -1007,7 +1294,14 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     if (e.type !== 'keydown') return
     // Time of day is edge-triggered rather than polled in the frame loop: each
     // press is one step, so holding the key does not run the clock away.
-    if (e.code === 'BracketLeft') atmos.setHour(atmos.hour - 0.5)
+    if (e.code === 'Enter') {
+      if (race.state !== 'IDLE') exitRace()
+      else if (Math.hypot(drone.position.x - RACE_C.x, drone.position.z - RACE_C.z) < ARENA_ENTER_R) {
+        // you have to show up to race — no starting from the far side of the map
+        enterRace()
+      }
+    }
+    else if (e.code === 'BracketLeft') atmos.setHour(atmos.hour - 0.5)
     else if (e.code === 'BracketRight') atmos.setHour(atmos.hour + 0.5)
     else if (e.code === 'Backslash') atmos.setCycle(atmos.cycling ? 0 : CYCLE_RATE)
   }
@@ -1077,6 +1371,20 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
         aware: +e.aware.toFixed(2),
       })),
       setKey: (code, v) => { keys[code] = v },
+      getRace: () => ({
+        state: race.state, lap: race.lap, laps: race.laps.slice(),
+        nextGate: race.nextGate, gatesPassed: race.gatesPassed,
+        pos: race.pos, total: race.total,
+        standings: race.standings.map((s) => ({ ...s })),
+        racers: racers.map((r) => ({
+          name: r.name, lap: r.lap, nextGate: r.nextGate, finished: r.finished,
+          pos: r.obj.position.toArray().map((v) => +v.toFixed(1)),
+        })),
+      }),
+      toggleRace: () => { race.state === 'IDLE' ? enterRace() : exitRace() },
+      getGates: () => gates.map((g) => ({
+        x: +g.x.toFixed(1), y: +g.y.toFixed(1), z: +g.z.toFixed(1),
+      })),
     }
   }
 
@@ -1106,7 +1414,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw))
     const right = new THREE.Vector3().crossVectors(forward, up)
     const acc = new THREE.Vector3()
-    if (!playerDown) {
+    if (!playerDown && race.state !== 'COUNTDOWN') {
       if (keys.KeyW) acc.add(forward)
       if (keys.KeyS) acc.sub(forward)
       if (keys.KeyD) acc.add(right)
@@ -1120,6 +1428,8 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
       acc.y -= 30 // shot down: gravity takes over
       yaw += 2.5 * dt
       if (keys.KeyR) {
+        // a crash ends the race; redeploy is back at the powerline spawn
+        if (race.state !== 'IDLE') exitRace()
         drone.position.set(X0 - 25, 26, 22)
         vel.set(0, 0, 0)
         integrity = 100
@@ -1597,6 +1907,8 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
       integrity = Math.min(100, integrity + 2 * dt)
     }
 
+    updateRace(dt, t)
+
     // tilt with acceleration
     const fSpd = vel.dot(forward)
     const sSpd = vel.dot(right)
@@ -1717,6 +2029,24 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
         down: playerDown,
         recentDamage: t - lastDamage < 0.5,
         tod: atmos.label,
+        arenaDist: Math.hypot(p.x - RACE_C.x, p.z - RACE_C.z),
+        nearArena: Math.hypot(p.x - RACE_C.x, p.z - RACE_C.z) < ARENA_ENTER_R,
+        race: race.state === 'IDLE' ? null : {
+          state: race.state,
+          count: race.state === 'COUNTDOWN' ? Math.max(1, Math.ceil(race.countEnd - t)) : 0,
+          go: race.state === 'RACING' && t - race.t0 < 1.2,
+          lap: Math.min(race.lap + 1, RACE_LAPS),
+          lapsMax: RACE_LAPS,
+          cur: race.state === 'RACING' ? t - race.lapStart : 0,
+          last: race.laps.length ? race.laps[race.laps.length - 1] : null,
+          best: race.best,
+          total: race.total,
+          laps: race.laps,
+          pos: race.pos,
+          n: racers.length + 1,
+          nextDist: race.state === 'RACING' ? race.nextDist : null,
+          standings: race.standings,
+        },
       })
     }
 
@@ -1739,7 +2069,8 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
         behind,
         dist: Math.hypot(p.x - SAFEHOUSE.x, p.z - SAFEHOUSE.z),
         active: laden,
-        done: mission === 'COMPLETE',
+        // the safehouse marker has no business on screen inside the arena
+        done: mission === 'COMPLETE' || race.state !== 'IDLE',
       })
     }
   }
@@ -1762,6 +2093,121 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
 // ---------------------------------------------------------------------------
 // builders
 // ---------------------------------------------------------------------------
+
+// Race venue at the foot of the start/finish gate: a start straight with grid
+// slots, an overhead gantry on the finish line, grandstands, pits, paddock
+// tents, flags and barriers. All meshes come from the Kenney Racing Kit (CC0,
+// kenney.nl) in /public/models/race — nothing here is hand-modelled.
+function buildRaceVenue(scene, structures) {
+  const loader = new GLTFLoader()
+  const cache = new Map()
+  const load = (file) => {
+    if (!cache.has(file)) {
+      cache.set(file, new Promise((resolve) => {
+        loader.load(`/models/race/${file}.glb`, (g) => resolve(g.scene),
+          undefined, () => resolve(null))   // venue is decoration; missing model = skip
+      }))
+    }
+    return cache.get(file)
+  }
+
+  // size scales the largest horizontal dimension; height scales bbox height
+  // instead (for tall thin things like light posts). alongZ auto-rotates the
+  // model's long axis onto the given world axis, so the exact authoring axis
+  // of each kit piece doesn't need to be known.
+  function place(file, { x, z, rot = 0, size, height, alongZ, lift = 0, collide }) {
+    load(file).then((proto) => {
+      if (!proto) return
+      const m = proto.clone(true)
+      const box = new THREE.Box3().setFromObject(m)
+      const dim = box.getSize(new THREE.Vector3())
+      const s = height
+        ? height / Math.max(dim.y, 0.001)
+        : size / Math.max(dim.x, dim.z, 0.001)
+      m.scale.setScalar(s)
+      if (alongZ !== undefined) {
+        const longX = dim.x > dim.z
+        if ((alongZ && longX) || (!alongZ && !longX)) rot += Math.PI / 2
+      }
+      m.rotation.y = rot
+      const groundY = terrainHeight(x, z)
+      m.position.set(x, groundY - box.min.y * s + lift, z)
+      m.traverse((o) => {
+        if (o.isMesh) { o.castShadow = true; o.receiveShadow = true }
+      })
+      scene.add(m)
+      if (collide) {
+        structures.push({
+          kind: 'box', x, z, hw: collide.w / 2, hd: collide.d / 2,
+          y0: groundY, y1: groundY + collide.h, rot,
+          bound: Math.hypot(collide.w / 2, collide.d / 2),
+        })
+      }
+    })
+  }
+
+  const V = VENUE
+  // start straight along +z (the direction of travel through gate 0),
+  // finish line under the gantry at the gate itself
+  place('roadStraightLong', { x: V.x, z: V.z - 42, alongZ: true, size: 30, lift: 0.1 })
+  place('roadStartPositions', { x: V.x, z: V.z - 12, alongZ: true, size: 30, lift: 0.1 })
+  place('roadStraightLong', { x: V.x, z: V.z + 18, alongZ: true, size: 30, lift: 0.1 })
+  place('roadStraightLong', { x: V.x, z: V.z + 48, alongZ: true, size: 30, lift: 0.1 })
+  place('overheadLights', { x: V.x, z: V.z, alongZ: false, size: 26 })
+
+  // grandstands face the straight from the east
+  for (const dz of [-16, 0, 16]) {
+    place('grandStandCovered', {
+      x: V.x + 14, z: V.z + dz, rot: -Math.PI / 2, size: 11,
+      collide: { w: 9, d: 11, h: 11 },
+    })
+  }
+  place('billboard', { x: V.x + 26, z: V.z, rot: -Math.PI / 2, size: 10 })
+
+  // pit row and paddock on the west side
+  place('pitsGarage', {
+    x: V.x - 17, z: V.z - 16, rot: Math.PI / 2, size: 16,
+    collide: { w: 10, d: 16, h: 6 },
+  })
+  place('pitsGarageClosed', {
+    x: V.x - 17, z: V.z + 2, rot: Math.PI / 2, size: 16,
+    collide: { w: 10, d: 16, h: 6 },
+  })
+  place('pitsOffice', {
+    x: V.x - 17, z: V.z + 19, rot: Math.PI / 2, size: 13,
+    collide: { w: 9, d: 13, h: 6 },
+  })
+  place('tentLong', {
+    x: V.x - 28, z: V.z - 34, size: 13, collide: { w: 13, d: 9, h: 5 },
+  })
+  place('tent', {
+    x: V.x - 26, z: V.z + 34, size: 9, collide: { w: 9, d: 9, h: 5 },
+  })
+  place('raceCarRed', { x: V.x - 10, z: V.z - 26, alongZ: true, size: 5 })
+  place('raceCarGreen', { x: V.x - 10, z: V.z - 33, alongZ: true, size: 5 })
+
+  // flags, lights and dressing
+  place('flagCheckers', { x: V.x - 9, z: V.z - 2, height: 8 })
+  place('flagCheckers', { x: V.x + 9, z: V.z + 2, height: 8 })
+  place('flagGreen', { x: V.x - 9, z: V.z + 40, height: 7 })
+  place('flagRed', { x: V.x + 9, z: V.z - 40, height: 7 })
+  for (const [dx, dz] of [[-11, -52], [11, -52], [-11, 52], [11, 52]]) {
+    place('lightPostLarge', { x: V.x + dx, z: V.z + dz, height: 13 })
+  }
+  place('bannerTowerGreen', { x: V.x - 12, z: V.z - 60, height: 10 })
+  place('bannerTowerRed', { x: V.x + 12, z: V.z - 60, height: 10 })
+
+  // barriers lining both edges of the straight
+  for (let i = 0; i < 12; i++) {
+    const bz = V.z - 55 + i * 10
+    const file = i % 2 ? 'barrierRed' : 'barrierWhite'
+    place(file, { x: V.x - 8.5, z: bz, alongZ: true, size: 9 })
+    place(file, { x: V.x + 8.5, z: bz, alongZ: true, size: 9 })
+  }
+  for (const [dx, dz] of [[-6, -64], [6, -64], [-6, 64], [6, 64]]) {
+    place('pylon', { x: V.x + dx, z: V.z + dz, height: 1.6 })
+  }
+}
 
 function beam(a, b, r, mat) {
   const len = a.distanceTo(b)
