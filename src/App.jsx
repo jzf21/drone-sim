@@ -23,6 +23,13 @@ const THREAT = {
   },
 }
 
+function fmtLap(s) {
+  if (s == null) return '--.--'
+  const m = Math.floor(s / 60)
+  const r = s - m * 60
+  return m > 0 ? `${m}:${r.toFixed(2).padStart(5, '0')}` : r.toFixed(2)
+}
+
 function headingLetter(deg) {
   const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
   return dirs[Math.round(deg / 45) % 8]
@@ -102,6 +109,7 @@ export default function App() {
           <span><b>W A S D</b> move</span>
           <span><b>SPACE / SHIFT</b> up / down</span>
           <span><b>Q / E</b> or <b>← →</b> yaw</span>
+          <span><b>ENTER</b> race (at the racetrack)</span>
         </div>
         <div className="hint">
           Fly within the cyan scan ring of line hardware to log it. Red = needs service.
@@ -109,7 +117,24 @@ export default function App() {
         </div>
       </div>
 
-      {telem && (
+      {telem?.race && (
+        <div className="panel race">
+          <h2>🏁 DRONE GP · LAP {telem.race.lap}/{telem.race.lapsMax}</h2>
+          <div className="telem-row"><span>POSITION</span><b>P{telem.race.pos} / {telem.race.n}</b></div>
+          <div className="telem-row"><span>LAP TIME</span><b>{fmtLap(telem.race.cur)}</b></div>
+          <div className="telem-row small"><span>LAST LAP</span><b>{fmtLap(telem.race.last)}</b></div>
+          <div className="telem-row small"><span>BEST LAP</span><b>{fmtLap(telem.race.best)}</b></div>
+          {telem.race.nextDist != null && (
+            <div className="telem-row small"><span>NEXT GATE</span><b>{telem.race.nextDist.toFixed(0)} m</b></div>
+          )}
+          <div className="hint">
+            Fly through the glowing cyan ring — the light column marks it.
+            Press <b>ENTER</b> to leave the arena.
+          </div>
+        </div>
+      )}
+
+      {telem && !telem.race && (
         <div className="panel mission">
           <h2>MISSION · CARGO RECOVERY</h2>
           {telem.mission === 'COMPLETE' ? (
@@ -159,7 +184,7 @@ export default function App() {
         </div>
       )}
 
-      {telem && (
+      {telem && !telem.race && (
         <div className={`panel exposure ${telem.threat.toLowerCase()}`}>
           <h2>EXPOSURE</h2>
           <div className="threat-state">
@@ -185,6 +210,9 @@ export default function App() {
           <div className="telem-row"><span>HDG</span><b>{telem.heading.toFixed(0)}° {headingLetter(telem.heading)}</b></div>
           <div className="telem-row"><span>POS</span><b>{telem.x.toFixed(0)}, {telem.z.toFixed(0)}</b></div>
           <div className="telem-row"><span>TIME</span><b>{telem.tod}</b></div>
+          {!telem.race && (
+            <div className="telem-row small"><span>RACETRACK</span><b>{telem.arenaDist.toFixed(0)} m</b></div>
+          )}
           <div className="progress">
             <div className="bar" style={{ width: `${(telem.scanned / telem.total) * 100}%` }} />
           </div>
@@ -225,6 +253,29 @@ export default function App() {
           </div>
         </div>
       )}
+      {telem?.race?.state === 'COUNTDOWN' && (
+        <div className="hud race-count">{telem.race.count}</div>
+      )}
+      {telem?.race?.go && <div className="hud race-count go">GO!</div>}
+      {telem?.race?.state === 'DONE' && (
+        <div className="hud race-done">
+          <div className="complete-title">RACE COMPLETE · P{telem.race.pos}</div>
+          <div className="race-times">
+            {telem.race.laps.map((l, i) => (
+              <div key={i}><span>LAP {i + 1}</span><b>{fmtLap(l)}</b></div>
+            ))}
+            <div className="total"><span>TOTAL</span><b>{fmtLap(telem.race.total)}</b></div>
+          </div>
+          <div className="race-standings">
+            {telem.race.standings.map((s, i) => (
+              <div key={s.name} className={s.name === 'YOU' ? 'you' : ''}>
+                <span>{i + 1}. {s.name}</span><b>{s.done ? fmtLap(s.time) : 'racing…'}</b>
+              </div>
+            ))}
+          </div>
+          <div className="complete-sub">press <b>ENTER</b> to leave the arena</div>
+        </div>
+      )}
       {telem && telem.mission === 'COMPLETE' && (
         <div className="hud complete-overlay">
           <div className="complete-title">MISSION COMPLETE</div>
@@ -236,6 +287,9 @@ export default function App() {
       )}
       {telem && telem.inZone && telem.threat !== 'ENGAGED' && !telem.down && (
         <div className="hud zone-notice">⌖ INSIDE HOSTILE PERIMETER</div>
+      )}
+      {telem && !telem.race && telem.nearArena && !telem.down && (
+        <div className="hud race-invite">🏁 RACETRACK — press <b>ENTER</b> to line up on the grid</div>
       )}
       {telem && telem.recentDamage && !telem.down && <div className="hud damage-vignette" />}
       {telem && telem.recentHit && (
@@ -264,7 +318,7 @@ export default function App() {
         </div>
       </div>
 
-      {telem && (
+      {telem && !telem.race && (
         <svg className="hud minimap" viewBox="0 0 300 90">
           <rect x="0" y="0" width="300" height="90" rx="6" className="mm-bg" />
           <line x1="20" y1="45" x2="280" y2="45" className="mm-line" />
