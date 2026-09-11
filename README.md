@@ -76,6 +76,8 @@ every sightline but the mouth is blocked. You can duck into it any time.
   warehouses, barns, silos and water towers scattered across the map, and
   substations flanking the powerline corridor. All of it is solid — it blocks
   movement, sightlines and gunfire, and the roofs are landable.
+- The Kerala backwaters fun zone to the south (see below): a lagoon with
+  palm islands, houseboats, fishing nets and a gated race loop.
 - A hostile airspace zone (red perimeter, southeast beyond the pond). Crossing
   the perimeter no longer gives you away by itself; it just puts you inside the
   rivals' patrol envelope. Watch the INTEGRITY bar — collisions and hits drain
@@ -118,6 +120,38 @@ What does not help:
 - **Grabbing the pod quietly.** The winch and the pod itself are loud —
   detection rates rise sharply while securing and carrying, so the long run home
   to the safehouse is where cover earns its keep.
+
+## Fun zone — the Kerala backwaters
+
+South-west of the powerline, past the hills and well west of the racetrack,
+a lagoon is dug into a valley bowl:
+palm-fringed islands, a fishing village with clay-tiled houses, a paddy
+terrace and a jetty, Chinese fishing nets dipping on the shore, kettuvallam
+houseboats moored off the islands, and a snake boat pacing the channels. It
+is centred about 500 m south-west of the corridor. Nothing hostile comes here — the rivals' circuits are
+850 m away and their sensors reach 155 m — so it is the place to just fly.
+
+### The backwater run
+
+A timed lap through 12 gates strung over the water: bamboo poles, a crossbar
+at 11 m, and a string of festival lamps. The FUN ZONE panel shows the
+distance to the lagoon and your best lap.
+
+- Fly in through the cyan-lit **start gate** off the village jetty to start
+  the clock. The next gate lights amber; gates you have taken turn green.
+- Gates count only in order, only between the poles, only under the bar.
+  Missing one just means going back for it.
+- Crossing the start gate again closes the lap. Your best lap is kept for the
+  session and shown in the panel; a new best gets a green overlay.
+- Two houseboats drift the course at walking pace and the snake boat laps it
+  faster. They are solid — thread past them or lose integrity.
+- Leaving the lagoon or getting shot down voids the run. The poles are solid
+  too; the lamps and bar are not.
+
+No new keys, and it is separate from the drone GP at the racetrack: you fly
+the backwater run freely, no ENTER needed. The run lives in `src/race.js`
+(pure logic, unit tested with `npm test`) and the zone itself in
+`src/kerala.js`.
 
 ## Credits
 

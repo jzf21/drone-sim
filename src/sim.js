@@ -2,6 +2,8 @@ import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { createAtmosphere } from './atmosphere.js'
 import { createPostFX } from './postfx.js'
+import { KERALA, buildKerala, keralaTerrain, keralaTint, isInKerala } from './kerala.js'
+import { createRace } from './race.js'
 
 // ---------------------------------------------------------------------------
 // Powerline inspection drone simulation
@@ -144,7 +146,8 @@ export function terrainHeight(x, z) {
   const vdz = z - VENUE.z
   const vd = Math.sqrt(vdx * vdx + vdz * vdz)
   if (vd < 120) h = THREE.MathUtils.lerp(VENUE.h, h, THREE.MathUtils.smoothstep(vd, 65, 120))
-  return h
+  // the backwater lagoon and its islands, south-west of the line
+  return keralaTerrain(x, z, h)
 }
 
 const FAULT_NOTES = {
@@ -153,7 +156,7 @@ const FAULT_NOTES = {
   splice: ['Hotspot detected', 'Corrosion at sleeve', 'Bird-caging strands'],
 }
 
-export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }) {
+export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint, onRaceClock }) {
   // Two streams, following the same convention as the cloud deck's `crand`:
   // `drand` drives world decoration (mountain ring, structures, vegetation) and
   // `rand` drives inspection content (which parts exist, which are faulted).
@@ -243,6 +246,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     const ROCK = new THREE.Color(0x918c84)
     const SNOW = new THREE.Color(0xf4f8fa)
     const SAND = new THREE.Color(0xc9b98d)
+    const LUSH = new THREE.Color(0x4a9c3a)
     const sstep = THREE.MathUtils.smoothstep
     for (let i = 0; i < pos.count; i++) {
       const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i)
@@ -261,6 +265,12 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
         1 - sstep(rd, 7, 16)
       )
       c.lerp(SAND, wet * 0.9)
+      // the backwaters: tropical green on the islands, wet sand at the waterline
+      const kt = keralaTint(x, z, y)
+      if (kt) {
+        c.lerp(LUSH, kt.lush)
+        c.lerp(SAND, kt.sand)
+      }
       const n = 0.92 + 0.16 * (Math.sin(x * 0.13) * Math.cos(z * 0.11) * 0.5 + 0.5)
       col[i * 3] = c.r * n
       col[i * 3 + 1] = c.g * n
@@ -430,9 +440,16 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     }
   }
 
+  // -- the Kerala backwaters: the fun zone ----------------------------------
+  // Built here, next to the rest of the water, because its lagoon has to be
+  // part of the water surface the drone can land on. Its colliders join the
+  // structure and tree sets further down, once those exist.
+  const kerala = buildKerala(scene, { hdr, waterMat, terrainHeight })
+  const run = createRace(kerala.gates)   // the backwater run; `race` is the GP
+
   // highest water surface under (x, z), or -Infinity if over dry land
   function waterSurfaceAt(x, z) {
-    let y = -Infinity
+    let y = kerala.waterSurfaceAt(x, z)
     const pdx = x - POND.x, pdz = z - POND.z
     if (pdx * pdx + pdz * pdz < (POND.r * 0.92) ** 2) y = Math.max(y, pondWaterY)
     const qdx = x - POOL.x, qdz = z - POOL.z
@@ -465,6 +482,10 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   // the race arena claims its plot too — no forest growing through the circuit
   structureFootprints.push({ x: RACE_C.x, z: RACE_C.z, r: 165 })
   const treeColliders = scatterVegetation(scene, drand, structureFootprints)
+  // the lagoon's gate poles, houses and boats block and occlude like anything
+  // else; its palms screen optics like the other trees
+  structures.push(...kerala.colliders)
+  treeColliders.push(...kerala.treeColliders)
 
   // -- sightlines ------------------------------------------------------------
   // Foliage occludes optics but not radar, so trees are kept as a separate set:
@@ -1345,12 +1366,15 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     window.__droneDebug = {
       setPos: (x, y, z) => drone.position.set(x, y, z),
       setYaw: (v) => { yaw = v },
+      setVel: (x, y, z) => vel.set(x, y, z),
       getPos: () => drone.position.toArray(),
       getHits: () => hits,
       getMission: () => ({
         mission, secure, deliver, integrity: Math.round(integrity), down: playerDown,
       }),
       safehouse: () => ({ x: SAFEHOUSE.x, y: HOME_Y, z: SAFEHOUSE.z }),
+      getRun: () => ({ state: run.state, next: run.next, time: run.time, best: run.best, lastLap: run.lastLap }),
+      runGates: () => run.gates.map((g) => ({ ...g })),
       getExposure: () => ({ threat, exposure: alertLevel, eyesOn, inCover, squad: squad.has }),
       getEnemyStates: () => enemies.map((e) => ({
         state: e.state, aware: +e.aware.toFixed(2), visible: e.visible,
@@ -1397,6 +1421,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
   const TMP_SEP = new THREE.Vector3()
   const TMP_N = new THREE.Vector3()
   const TMP_MARK = new THREE.Vector3()
+  const runPrev = new THREE.Vector3().copy(drone.position)
   const clock = new THREE.Clock()
   let telemAcc = 0
   let frames = 0
@@ -1451,6 +1476,7 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
           e.inRange = false
         }
         if (mission !== 'COMPLETE') { mission = 'INBOUND'; secure = 0; deliver = 0 }
+        run.reset()
       }
     }
 
@@ -1545,6 +1571,17 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
     }
 
     updateWater(dt, t)
+
+    // the backwater run ---------------------------------------------------
+    // Stepped on the post-collision position, against where it was last
+    // frame, so a bounce off a gate pole cannot count as threading the gate.
+    const inKerala = isInKerala(p.x, p.z)
+    for (const ev of run.step({ prev: runPrev, cur: p, t, inZone: inKerala, down: playerDown })) {
+      if (ev === 'GATE') sparkBurst(p, 8, 0xffd27a, 5)
+      else if (ev === 'LAP') sparkBurst(p, 40, run.newBest ? 0x8fffc4 : 0xffd27a, 10)
+    }
+    runPrev.copy(p)
+    kerala.update(dt, t, run)
 
     // hostile territory ----------------------------------------------------
     const zdx = p.x - ZONE.x
@@ -2047,6 +2084,19 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
           nextDist: race.state === 'RACING' ? race.nextDist : null,
           standings: race.standings,
         },
+        // the backwater run, in the Kerala fun zone (see race.js)
+        backwater: {
+          state: run.state,           // IDLE | READY | RUNNING
+          next: run.next,
+          gates: run.gates.length,
+          best: run.best,
+          lastLap: run.lastLap,
+          newBest: run.newBest,
+          lapAt: run.lapAt,
+          celebrate: t - run.lapAt < 5,
+          inZone: inKerala,
+          dist: Math.hypot(p.x - KERALA.x, p.z - KERALA.z),
+        },
       })
     }
 
@@ -2073,6 +2123,8 @@ export function createSim(canvas, { onTelemetry, onDetect, onReady, onWaypoint }
         done: mission === 'COMPLETE' || race.state !== 'IDLE',
       })
     }
+    // The run clock wants every frame, not the 8 Hz telemetry tick.
+    if (onRaceClock) onRaceClock({ state: run.state, next: run.next, time: run.time })
   }
   animate()
 
@@ -2644,7 +2696,10 @@ function scatterVegetation(scene, rand, footprints = []) {
     if (dx * dx + dz * dz < (POND.r + 25) * (POND.r + 25)) return true
     if (riverNearest(x, z).d < 24) return true
     const mdx = x - MTN.x, mdz = z - MTN.z
-    return mdx * mdx + mdz * mdz < 50 * 50 // rocky summit stays bare
+    if (mdx * mdx + mdz * mdz < 50 * 50) return true // rocky summit stays bare
+    // the lagoon dresses itself: palms, not pines
+    const kdx = x - KERALA.x, kdz = z - KERALA.z
+    return kdx * kdx + kdz * kdz < (KERALA.r * 1.3) ** 2
   }
 
   // buildings claim their plot; nothing grows through a roof
@@ -3155,6 +3210,8 @@ function buildStructures(scene, rand, ZONE_ARG) {
     if (mdx * mdx + mdz * mdz < 110 * 110) continue         // off the mountain
     const cdx = x - zx, cdz = z - zz
     if (cdx * cdx + cdz * cdz < 120 * 120) continue         // compound owns its ground
+    const kdx = x - KERALA.x, kdz = z - KERALA.z
+    if (kdx * kdx + kdz * kdz < (KERALA.r * 1.35) ** 2) continue   // and the lagoon its own
     if (footprints.some((f) => (f.x - x) ** 2 + (f.z - z) ** 2 < 52 * 52)) continue
     // steep ground reads as a building sunk into a hillside — skip it
     const y = gh(x, z)
