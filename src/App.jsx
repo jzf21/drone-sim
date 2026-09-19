@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { createSim } from './sim.js'
+import { formatLap } from './race.js'
 
 const LINE_LEN = 140 * 6
 
@@ -30,6 +31,34 @@ function fmtLap(s) {
   return m > 0 ? `${m}:${r.toFixed(2).padStart(5, '0')}` : r.toFixed(2)
 }
 
+// Pin a screen-space marker to a projected point, or to the screen edge in its
+// direction when it is off-screen or behind the camera. Written straight to
+// the DOM: it moves every frame.
+function placeMarker(el, arrow, w) {
+  let { x, y } = w
+  if (w.behind) {
+    // behind the camera the projected position is meaningless; only the
+    // direction is, so push it well outside the viewport and let the
+    // clamp below pin it to the correct edge
+    const len = Math.hypot(x, y) || 1
+    x = (x / len) * 2
+    y = (y / len) * 2
+  }
+  const off = w.behind || Math.abs(x) > 1 || Math.abs(y) > 1
+  if (off) {
+    // scale the direction out to whichever screen edge it meets first
+    const k = Math.min(1 / Math.max(Math.abs(x), 1e-6), 1 / Math.max(Math.abs(y), 1e-6))
+    x *= k
+    y *= k
+  }
+  const M = 7   // percent inset, so the marker never straddles the edge
+  el.style.left = `${50 + x * (50 - M)}%`
+  el.style.top = `${50 - y * (50 - M)}%`
+  el.classList.toggle('offscreen', off)
+  // the chevron points up by default; screen direction is (x, -y)
+  if (arrow) arrow.style.transform = `rotate(${(Math.atan2(x, y) * 180) / Math.PI}deg)`
+}
+
 function headingLetter(deg) {
   const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
   return dirs[Math.round(deg / 45) % 8]
@@ -48,6 +77,8 @@ export default function App() {
   const wpArrowRef = useRef(null)
   const wpNameRef = useRef(null)
   const wpDistRef = useRef(null)
+  const lapClockRef = useRef(null)
+  const lapGateRef = useRef(null)
 
   useEffect(() => {
     const sim = createSim(canvasRef.current, {
@@ -60,37 +91,18 @@ export default function App() {
         // hide once delivered, and when you are close enough to just look at it
         if (w.done || w.dist < 30) { el.style.display = 'none'; return }
         el.style.display = ''
-
-        let { x, y } = w
-        if (w.behind) {
-          // behind the camera the projected position is meaningless; only the
-          // direction is, so push it well outside the viewport and let the
-          // clamp below pin it to the correct edge
-          const len = Math.hypot(x, y) || 1
-          x = (x / len) * 2
-          y = (y / len) * 2
-        }
-        const off = w.behind || Math.abs(x) > 1 || Math.abs(y) > 1
-        if (off) {
-          // scale the direction out to whichever screen edge it meets first
-          const k = Math.min(1 / Math.max(Math.abs(x), 1e-6), 1 / Math.max(Math.abs(y), 1e-6))
-          x *= k
-          y *= k
-        }
-        const M = 7   // percent inset, so the marker never straddles the edge
-        el.style.left = `${50 + x * (50 - M)}%`
-        el.style.top = `${50 - y * (50 - M)}%`
-        el.classList.toggle('offscreen', off)
+        placeMarker(el, wpArrowRef.current, w)
         el.classList.toggle('active', w.active)
-        // the chevron points up by default; screen direction is (x, -y)
-        if (wpArrowRef.current) {
-          wpArrowRef.current.style.transform =
-            `rotate(${(Math.atan2(x, y) * 180) / Math.PI}deg)`
-        }
         if (wpNameRef.current) {
           wpNameRef.current.textContent = w.active ? 'DELIVER HERE' : 'SAFEHOUSE'
         }
         if (wpDistRef.current) wpDistRef.current.textContent = `${w.dist.toFixed(0)} m`
+      },
+      onRaceClock: (w) => {
+        if (lapClockRef.current) lapClockRef.current.textContent = formatLap(w.time)
+        if (lapGateRef.current) {
+          lapGateRef.current.textContent = w.next === 0 ? 'TO FINISH' : `GATE ${w.next}`
+        }
       },
     })
     return () => sim.dispose()
@@ -200,6 +212,40 @@ export default function App() {
           <div className="hint">{THREAT[telem.threat].hint}</div>
         </div>
       )}
+
+      {telem && !telem.race && (
+        <div className={`panel funzone ${telem.backwater.state.toLowerCase()}`}>
+          <h2>FUN ZONE · KERALA BACKWATERS</h2>
+          {telem.backwater.celebrate && telem.backwater.lastLap !== null ? (
+            <div className={`mission-line ${telem.backwater.newBest ? 'done' : 'hot'}`}>
+              ✔ LAP {formatLap(telem.backwater.lastLap)}{telem.backwater.newBest ? ' — NEW BEST' : ''}
+            </div>
+          ) : telem.backwater.state === 'RUNNING' ? (
+            <div className="mission-line hot">
+              ◆ RUN IN PROGRESS — gate {telem.backwater.next === 0 ? 'FINISH' : `${telem.backwater.next} of ${telem.backwater.gates - 1}`}
+            </div>
+          ) : telem.backwater.state === 'READY' ? (
+            <div className="mission-line">◆ Fly through the lit START gate to begin the backwater run</div>
+          ) : (
+            <div className="mission-line">◆ Backwater run — a timed lap through {telem.backwater.gates} gates over the lagoon</div>
+          )}
+          {!telem.backwater.inZone && (
+            <div className="telem-row small">
+              <span>TO LAGOON</span><b>{telem.backwater.dist.toFixed(0)} m</b>
+            </div>
+          )}
+          <div className="telem-row small">
+            <span>BEST LAP</span><b>{formatLap(telem.backwater.best)}</b>
+          </div>
+          <div className="hint">
+            {telem.backwater.state === 'RUNNING'
+              ? 'Gates in order, under the bar, between the poles. Mind the houseboats — they drift the channels. Leaving the lagoon voids the run.'
+              : telem.backwater.inZone
+                ? 'No rivals here. Fly under the bar of the cyan-lit start gate off the village jetty; the next gate lights amber as you go.'
+                : 'Head south-west, over the hills past the wires and well west of the racetrack. The start gate is the cyan-lit one off the village jetty.'}
+          </div>
+        </div>
+      )}
       </div>
 
       {telem && (
@@ -290,6 +336,20 @@ export default function App() {
       )}
       {telem && !telem.race && telem.nearArena && !telem.down && (
         <div className="hud race-invite">🏁 RACETRACK — press <b>ENTER</b> to line up on the grid</div>
+      )}
+      {telem && telem.backwater.state === 'RUNNING' && !telem.down && (
+        <div className="hud run-banner">
+          <b ref={lapClockRef}>00:00.0</b>
+          <span ref={lapGateRef}>GATE 1</span>
+        </div>
+      )}
+      {telem && telem.backwater.celebrate && telem.backwater.lastLap !== null && (
+        <div className={`hud lap-overlay ${telem.backwater.newBest ? 'best' : ''}`} key={telem.backwater.lapAt}>
+          <div className="lap-title">{formatLap(telem.backwater.lastLap)}</div>
+          <div className="lap-sub">
+            {telem.backwater.newBest ? 'NEW BEST LAP · backwater run' : `lap complete · best ${formatLap(telem.backwater.best)}`}
+          </div>
+        </div>
       )}
       {telem && telem.recentDamage && !telem.down && <div className="hud damage-vignette" />}
       {telem && telem.recentHit && (
